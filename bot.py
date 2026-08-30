@@ -11,8 +11,11 @@
   пока пользователь задаёт по нему вопросы;
 - принимает голосовые и аудиофайлы (m4a, mp3, …), в том числе присланные
   документом: расшифровывает их локально через faster-whisper (модель small,
-  русский язык) и обрабатывает как обычный текст;
+  русский), затем прогоняет текст через claude-sonnet-5 — чистит орфографию,
+  пунктуацию, слова-паразиты, разбивает на абзацы; для длинных записей добавляет
+  структурное резюме. Сырая расшифровка не выводится, доступна по /raw;
 - команда /reset очищает историю пользователя, /history показывает её размер,
+  /raw показывает сырую расшифровку последнего аудио,
   /forget убирает документ из контекста;
 - умеет искать в интернете (web_search) и показывает ссылки на источники;
 - если Anthropic API вернул ошибку — бот пишет об этом в чат и продолжает работать.
@@ -21,8 +24,8 @@
 """
 
 import asyncio
-import html
 import io
+import json
 import logging
 import os
 import sqlite3
@@ -34,7 +37,7 @@ import docx
 import pypdf
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -108,6 +111,13 @@ WHISPER_LANGUAGE = "ru"
 # откажет (расшифровка долгих записей занимает много времени и памяти).
 MAX_VOICE_SECONDS = 120
 
+# После расшифровки текст прогоняется через модель: чистится орфография,
+# пунктуация, убираются слова-паразиты и повторы, добавляются абзацы.
+# Если сырая расшифровка длиннее порога — добавляется структурное резюме.
+TRANSCRIPT_SUMMARY_THRESHOLD = 400
+# Не отдаём модели совсем гигантские расшифровки (защита от лишних трат).
+MAX_TRANSCRIPT_CHARS = 12_000
+
 # --- Логирование диалога ----------------------------------------------
 # Если True — весь диалог (сообщения пользователя и ответы Claude) пишется
 # в лог целиком, открытым текстом. Поставьте False, чтобы отключить.
@@ -154,6 +164,10 @@ claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 # Активный документ каждого пользователя (в памяти, при перезапуске сбрасывается):
 # {telegram_id: {"filename": str, "text": str, "size": int (байт)}}
 documents: dict[int, dict] = {}
+
+# Сырая расшифровка последнего аудио каждого пользователя — для команды /raw
+# (в памяти; в чат не выводится).
+raw_transcripts: dict[int, str] = {}
 
 
 # --- История диалогов: SQLite -----------------------------------------
@@ -297,6 +311,147 @@ def transcribe_voice(audio_bytes: bytes) -> str:
     return " ".join(segment.text.strip() for segment in segments).strip()
 
 
+# --- Обработка расшифровки моделью -------------------------------------
+
+_CLEAN_SYSTEM = (
+    "Ты редактор расшифровок голосовых сообщений. На входе — сырой текст "
+    "распознавания речи. Твоя работа:\n"
+    "• исправить орфографию и пунктуацию, расставить абзацы;\n"
+    "• убрать слова-паразиты, оговорки, самоповторы, «эканье»;\n"
+    "• СОХРАНИТЬ смысл и формулировки автора — ничего не перефразировать, "
+    "не добавлять и не додумывать;\n"
+    "• не отвечать на текст и не комментировать его.\n"
+    "Отвечай строго в формате JSON по заданной схеме, на русском языке."
+)
+
+_CLEAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "cleaned": {
+            "type": "string",
+            "description": (
+                "Вычищенный текст: орфография, пунктуация, абзацы; без слов-"
+                "паразитов и повторов. Смысл и формулировки не менять."
+            ),
+        },
+        "gist": {
+            "type": "string",
+            "description": (
+                "Краткая суть одной строкой. Пустая строка, если резюме не нужно."
+            ),
+        },
+        "key_points": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Ключевые пункты. Пустой массив, если их нет или резюме не нужно.",
+        },
+        "agreements": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Договорённости, которые ЯВНО прозвучали в тексте. "
+                "Пустой массив, если их нет."
+            ),
+        },
+        "tasks": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Задачи и поручения из текста. Пустой массив, если их нет."
+            ),
+        },
+    },
+    "required": ["cleaned", "gist", "key_points", "agreements", "tasks"],
+    "additionalProperties": False,
+}
+
+
+async def process_transcript(raw: str) -> str:
+    """Причёсывает расшифровку через модель и возвращает готовый текст для чата.
+
+    Если raw длиннее TRANSCRIPT_SUMMARY_THRESHOLD — добавляет структурное резюме.
+    Бросает исключение, если модель недоступна (вызывающий покажет сырой текст).
+    """
+    need_summary = len(raw) > TRANSCRIPT_SUMMARY_THRESHOLD
+
+    if need_summary:
+        task = (
+            "Запись длинная — помимо cleaned заполни резюме по её содержанию: "
+            "gist (суть одной строкой), key_points (ключевые пункты), "
+            "agreements (договорённости) и tasks (задачи). "
+            "Блок оставляй пустым, если в тексте этого нет."
+        )
+    else:
+        task = (
+            "Запись короткая — резюме не нужно: gist оставь пустой строкой, "
+            "key_points, agreements и tasks — пустыми массивами."
+        )
+
+    response = await claude.messages.create(
+        model=MODEL,
+        max_tokens=8000,
+        system=_CLEAN_SYSTEM,
+        messages=[{
+            "role": "user",
+            "content": f"{task}\n\nСырая расшифровка:\n---\n{raw}",
+        }],
+        output_config={"format": {"type": "json_schema", "schema": _CLEAN_SCHEMA}},
+    )
+    text = next(b.text for b in response.content if b.type == "text")
+    data = json.loads(text)
+
+    cleaned = (data.get("cleaned") or "").strip()
+    if not cleaned:
+        raise ValueError("модель вернула пустой cleaned")
+
+    parts = [cleaned]
+    if need_summary:
+        blocks = []
+        gist = (data.get("gist") or "").strip()
+        if gist:
+            blocks.append(f"📌 Суть: {gist}")
+        if data.get("key_points"):
+            blocks.append(
+                "🔑 Ключевые пункты:\n"
+                + "\n".join(f"• {p}" for p in data["key_points"])
+            )
+        if data.get("agreements"):
+            blocks.append(
+                "🤝 Договорённости:\n"
+                + "\n".join(f"• {a}" for a in data["agreements"])
+            )
+        if data.get("tasks"):
+            blocks.append(
+                "✅ Задачи:\n" + "\n".join(f"• {t}" for t in data["tasks"])
+            )
+        if blocks:
+            parts.append("— — — — —\n" + "\n\n".join(blocks))
+
+    return "\n\n".join(parts)
+
+
+async def send_chunks(message, text: str) -> None:
+    """Отправляет длинный текст, разбивая по абзацам на части ≤ 4096 символов."""
+    limit = 4096
+    if len(text) <= limit:
+        await message.reply_text(text)
+        return
+    chunk = ""
+    for para in text.split("\n\n"):
+        while len(para) > limit:  # одиночный абзац длиннее лимита — режем жёстко
+            if chunk:
+                await message.reply_text(chunk.strip())
+                chunk = ""
+            await message.reply_text(para[:limit])
+            para = para[limit:]
+        if len(chunk) + len(para) + 2 > limit and chunk:
+            await message.reply_text(chunk.strip())
+            chunk = ""
+        chunk = f"{chunk}\n\n{para}" if chunk else para
+    if chunk.strip():
+        await message.reply_text(chunk.strip())
+
+
 def _build_messages(history: list[dict], document: dict | None) -> list[dict]:
     """Собирает список сообщений для API. Если есть документ — подкладывает его в начало."""
     if not document:
@@ -413,7 +568,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! Я отвечаю с помощью Claude.\n\n"
         "• просто напишите сообщение — отвечу, при необходимости поищу в интернете;\n"
         "• пришлите файл PDF, DOCX или TXT — и задавайте вопросы по нему;\n"
-        "• запишите голосовое или пришлите аудиофайл — я расшифрую и отвечу;\n"
+        "• запишите голосовое или пришлите аудиофайл — я расшифрую его, "
+        "причешу текст и (если запись длинная) сделаю краткое резюме;\n"
+        "• /raw — сырая расшифровка последнего аудио;\n"
         "• /history — сколько сообщений сохранено;\n"
         "• /reset — очистить историю диалога;\n"
         "• /forget — убрать документ из контекста."
@@ -442,6 +599,22 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         f"В истории сохранено сообщений: {total}.\n"
         f"Модели передаю последние {shown}."
+    )
+
+
+async def raw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает сырую (необработанную) расшифровку последнего аудио."""
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    raw = raw_transcripts.get(update.effective_user.id)
+    if not raw:
+        await update.message.reply_text(
+            "Пока нет расшифровок. Пришлите голосовое или аудиофайл."
+        )
+        return
+    await send_chunks(
+        update.message, f"Сырая расшифровка последнего аудио:\n\n{raw}"
     )
 
 
@@ -690,28 +863,30 @@ async def _transcribe_and_reply(
         )
         return
 
-    # Убираем статус — дальше будет обычный ответ.
+    user_id = update.effective_user.id
+    # Сырую расшифровку сохраняем (для /raw), но в чат не выводим.
+    raw_transcripts[user_id] = recognized
+    if LOG_DIALOG:
+        logger.info("[%s] аудио, сырая расшифровка: %s", user_id, recognized)
+
+    await status.edit_text("✍️ Причёсываю текст…")
+    try:
+        result = await process_transcript(recognized[:MAX_TRANSCRIPT_CHARS])
+    except Exception:
+        logger.exception("Не удалось обработать расшифровку моделью")
+        result = (
+            "⚠️ Не получилось обработать текст через модель — вот сырая "
+            f"расшифровка:\n\n{recognized}"
+        )
+
     try:
         await status.delete()
     except Exception:
         pass
 
-    # Показываем распознанный текст курсивом — чтобы было видно ошибки распознавания.
-    # (Модель получит полный текст; в чате показываем максимум ~3500 символов.)
-    shown = recognized if len(recognized) <= 3500 else recognized[:3500] + "…"
-    try:
-        await update.message.reply_text(
-            f"🎙 <i>{html.escape(shown)}</i>", parse_mode=ParseMode.HTML
-        )
-    except Exception:
-        await update.message.reply_text(f"🎙 Распознано: {shown}")
-
-    # Дальше — ровно как с обычным текстовым сообщением.
-    answer = await get_model_answer(
-        update, context, update.effective_user.id, recognized
-    )
-    if answer is not None:
-        await update.message.reply_text(answer)
+    await send_chunks(update.message, result)
+    if LOG_DIALOG:
+        logger.info("[%s] аудио, результат: %s", user_id, result)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -770,6 +945,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler("raw", raw_cmd))
     app.add_handler(CommandHandler("forget", forget))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
