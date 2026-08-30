@@ -7,8 +7,9 @@
 - хранит историю диалога отдельно для каждого пользователя (последние 20 сообщений);
 - принимает файлы PDF, DOCX и TXT: извлекает текст и держит документ в контексте,
   пока пользователь задаёт по нему вопросы;
-- принимает голосовые: расшифровывает их локально через faster-whisper (модель
-  small, русский язык) и обрабатывает как обычный текст;
+- принимает голосовые и аудиофайлы (m4a, mp3, …), в том числе присланные
+  документом: расшифровывает их локально через faster-whisper (модель small,
+  русский язык) и обрабатывает как обычный текст;
 - команда /reset очищает историю, /forget убирает документ из контекста;
 - умеет искать в интернете (web_search) и показывает ссылки на источники;
 - если Anthropic API вернул ошибку — бот пишет об этом в чат и продолжает работать.
@@ -94,8 +95,8 @@ MAX_DOC_CHARS = 120_000
 WHISPER_MODEL_SIZE = "small"
 WHISPER_LANGUAGE = "ru"
 
-# Максимальная длительность голосового. Длиннее — бот вежливо откажет
-# (расшифровка долгих записей занимает много времени и памяти).
+# Максимальная длительность голосового / аудиофайла. Длиннее — бот вежливо
+# откажет (расшифровка долгих записей занимает много времени и памяти).
 MAX_VOICE_SECONDS = 120
 
 # --- Логирование диалога ----------------------------------------------
@@ -194,9 +195,18 @@ def _get_whisper_model():
                     "Загружаю модель распознавания речи faster-whisper (%s)…",
                     WHISPER_MODEL_SIZE,
                 )
-                _whisper_model = WhisperModel(
-                    WHISPER_MODEL_SIZE, device="cpu", compute_type="int8"
-                )
+                try:
+                    # Модель уже в кэше — грузим без обращения к сети
+                    # (иначе при плохом интернете загрузка подвисает).
+                    _whisper_model = WhisperModel(
+                        WHISPER_MODEL_SIZE, device="cpu",
+                        compute_type="int8", local_files_only=True,
+                    )
+                except Exception:
+                    logger.info("Модель не найдена в кэше — скачиваю (один раз)…")
+                    _whisper_model = WhisperModel(
+                        WHISPER_MODEL_SIZE, device="cpu", compute_type="int8"
+                    )
                 logger.info("Модель распознавания речи готова.")
     return _whisper_model
 
@@ -329,7 +339,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! Я отвечаю с помощью Claude.\n\n"
         "• просто напишите сообщение — отвечу, при необходимости поищу в интернете;\n"
         "• пришлите файл PDF, DOCX или TXT — и задавайте вопросы по нему;\n"
-        "• запишите голосовое — я расшифрую его и отвечу;\n"
+        "• запишите голосовое или пришлите аудиофайл — я расшифрую и отвечу;\n"
         "• /reset — очистить историю диалога;\n"
         "• /forget — убрать документ из контекста."
     )
@@ -518,43 +528,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(answer)
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_allowed(update):
-        await update.message.reply_text(DENY_TEXT)
-        return
+async def _transcribe_and_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tg_object,
+    duration: int | None,
+    kind: str,
+) -> None:
+    """Общий путь для голосовых и аудиофайлов: скачать → расшифровать → ответить.
 
-    voice = update.message.voice
+    tg_object — telegram.Voice / telegram.Audio / telegram.Document (у всех есть
+    get_file() и file_size). kind — слово для сообщений («Голосовое» / «Аудио»).
+    """
     logger.info(
-        "Голосовое получено: duration=%s size=%s mime=%s",
-        voice.duration, voice.file_size, voice.mime_type,
+        "%s получено: duration=%s size=%s mime=%s",
+        kind, duration, tg_object.file_size, getattr(tg_object, "mime_type", None),
     )
-    if voice.duration and voice.duration > MAX_VOICE_SECONDS:
+
+    if duration and duration > MAX_VOICE_SECONDS:
         await update.message.reply_text(
-            f"Голосовое слишком длинное ({voice.duration} с). "
+            f"{kind} слишком длинное ({duration} с). "
             f"Максимум — {MAX_VOICE_SECONDS} с. Разбейте на части или напишите текстом."
         )
         return
 
+    if tg_object.file_size and tg_object.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text(
+            f"Файл слишком большой ({human_size(tg_object.file_size)}). "
+            f"Максимум — {MAX_FILE_SIZE_MB} МБ."
+        )
+        return
+
     status = await update.message.reply_text(
-        "🎧 Расшифровываю голосовое… это не мгновенно, подождите минуту."
+        f"🎧 Расшифровываю ({kind.lower()})… это не мгновенно, подождите минуту."
     )
 
     try:
-        tg_file = await voice.get_file()
+        tg_file = await tg_object.get_file()
         audio_bytes = bytes(await tg_file.download_as_bytearray())
     except Exception:
-        logger.exception("Не удалось скачать голосовое из Telegram")
-        await status.edit_text("Не удалось скачать голосовое сообщение. Попробуйте ещё раз.")
+        logger.exception("Не удалось скачать аудио из Telegram")
+        await status.edit_text("Не удалось скачать файл. Попробуйте ещё раз.")
         return
 
-    logger.info("Голосовое скачано: %s байт, начинаю расшифровку", len(audio_bytes))
+    if len(audio_bytes) > MAX_FILE_SIZE:
+        await status.edit_text(
+            f"Файл слишком большой ({human_size(len(audio_bytes))}). "
+            f"Максимум — {MAX_FILE_SIZE_MB} МБ."
+        )
+        return
+
+    logger.info("Аудио скачано: %s байт, начинаю расшифровку", len(audio_bytes))
     try:
         recognized = await asyncio.to_thread(transcribe_voice, audio_bytes)
     except Exception:
-        logger.exception("Ошибка расшифровки голосового")
+        logger.exception("Ошибка расшифровки аудио")
         await status.edit_text(
-            "Не удалось расшифровать голосовое сообщение. "
-            "Попробуйте записать ещё раз или напишите текстом."
+            "Не удалось расшифровать запись. "
+            "Попробуйте другой файл или напишите текстом."
         )
         return
 
@@ -562,8 +593,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     recognized = (recognized or "").strip()
     if not recognized:
         await status.edit_text(
-            "В этом голосовом не удалось разобрать речь. "
-            "Попробуйте записать в тишине или напишите текстом."
+            "В этой записи не удалось разобрать речь. "
+            "Попробуйте другую запись или напишите текстом."
         )
         return
 
@@ -589,6 +620,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     if answer is not None:
         await update.message.reply_text(answer)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    voice = update.message.voice
+    await _transcribe_and_reply(update, context, voice, voice.duration, "Голосовое")
+
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Аудиофайлы: и присланные как аудио (message.audio), и как документ (audio/*)."""
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    audio = update.message.audio or update.message.document
+    duration = getattr(update.message.audio, "duration", None)
+    await _transcribe_and_reply(update, context, audio, duration, "Аудио")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -621,9 +670,16 @@ def main() -> None:
     app.add_handler(CommandHandler("forget", forget))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    # Аудио: и как аудио-сообщение, и как документ audio/* — ДО общего
+    # обработчика документов, иначе .m4a перехватится как обычный документ.
+    app.add_handler(
+        MessageHandler(
+            filters.AUDIO | filters.Document.Category("audio/"), handle_audio
+        )
+    )
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(
-        MessageHandler(filters.PHOTO | filters.AUDIO | filters.VIDEO, handle_unsupported)
+        MessageHandler(filters.PHOTO | filters.VIDEO, handle_unsupported)
     )
     app.add_error_handler(on_error)
 
