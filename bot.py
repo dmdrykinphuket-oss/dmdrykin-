@@ -5,17 +5,23 @@
 - отвечает только пользователям, чьи Telegram ID указаны в ALLOWED_USERS (.env),
   остальным — вежливый отказ;
 - хранит историю диалога отдельно для каждого пользователя (последние 20 сообщений);
-- команда /reset очищает историю конкретного пользователя;
+- принимает файлы PDF, DOCX и TXT: извлекает текст и держит документ в контексте,
+  пока пользователь задаёт по нему вопросы;
+- команда /reset очищает историю, /forget убирает документ из контекста;
+- умеет искать в интернете (web_search) и показывает ссылки на источники;
 - если Anthropic API вернул ошибку — бот пишет об этом в чат и продолжает работать.
 
 Токены читаются из файла .env и в коде не хранятся.
 """
 
+import io
 import logging
 import os
 
 from anthropic import AsyncAnthropic
 import anthropic
+import docx
+import pypdf
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
@@ -64,11 +70,25 @@ MAX_PAUSE_RESTARTS = 3
 # Telegram не принимает сообщения длиннее 4096 символов.
 TELEGRAM_MAX_LEN = 4000
 
+# --- Документы ----------------------------------------------------------
+# Какие форматы принимаем.
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt"}
+
+# Максимальный размер присланного файла. Больше — бот вежливо откажет.
+# (Telegram и так не даёт ботам скачивать файлы больше ~20 МБ.)
+MAX_FILE_SIZE_MB = 10
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+
+# Максимум символов текста из документа, который уходит модели.
+# Защищает от гигантских документов и лишних трат (~30 000 токенов).
+MAX_DOC_CHARS = 120_000
+
 SYSTEM_PROMPT = (
     "Ты дружелюбный ассистент в Telegram. Отвечай кратко и по делу, "
     "на том же языке, на котором пишет пользователь. "
     "Если вопрос требует свежих или проверяемых фактов — используй веб-поиск. "
-    "Если ответ ты и так знаешь — отвечай сразу, без поиска."
+    "Если ответ ты и так знаешь — отвечай сразу, без поиска. "
+    "Если пользователь прислал документ — отвечай на вопросы, опираясь на него."
 )
 
 
@@ -105,10 +125,70 @@ claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 # Хранится в оперативной памяти — после перезапуска бота история очищается.
 conversations: dict[int, list[dict]] = {}
 
+# Активный документ каждого пользователя:
+# {telegram_id: {"filename": str, "text": str, "size": int (байт)}}
+documents: dict[int, dict] = {}
+
 
 def is_allowed(update: Update) -> bool:
     user = update.effective_user
     return user is not None and user.id in ALLOWED_USERS
+
+
+def human_size(num_bytes: int) -> str:
+    """Размер в человекочитаемом виде: 1234 -> '1.2 КБ'."""
+    size = float(num_bytes)
+    for unit in ("Б", "КБ", "МБ"):
+        if size < 1024 or unit == "МБ":
+            return f"{size:.0f} {unit}" if unit == "Б" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+def extract_text(extension: str, data: bytes) -> str:
+    """Извлекает текст из файла PDF / DOCX / TXT."""
+    if extension == ".pdf":
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    if extension == ".docx":
+        document = docx.Document(io.BytesIO(data))
+        return "\n".join(p.text for p in document.paragraphs)
+    if extension == ".txt":
+        return data.decode("utf-8", errors="replace")
+    raise ValueError(f"Формат {extension} не поддерживается")
+
+
+def _build_messages(history: list[dict], document: dict | None) -> list[dict]:
+    """Собирает список сообщений для API. Если есть документ — подкладывает его в начало."""
+    if not document:
+        return list(history)
+    doc_block = {
+        "type": "document",
+        "source": {
+            "type": "text",
+            "media_type": "text/plain",
+            "data": document["text"],
+        },
+        "title": document["filename"],
+        # Кэшируем документ: повторные вопросы по нему обходятся заметно дешевле.
+        "cache_control": {"type": "ephemeral"},
+    }
+    preamble = [
+        {
+            "role": "user",
+            "content": [
+                doc_block,
+                {
+                    "type": "text",
+                    "text": (
+                        f"Пользователь прислал файл «{document['filename']}». "
+                        "Отвечай на его вопросы, опираясь на этот документ."
+                    ),
+                },
+            ],
+        },
+        {"role": "assistant", "content": "Документ получен. Задавайте вопросы по нему."},
+    ]
+    return preamble + list(history)
 
 
 async def _create_message(messages: list[dict], use_web_search: bool):
@@ -123,9 +203,9 @@ async def _create_message(messages: list[dict], use_web_search: bool):
     return await claude.messages.create(**kwargs)
 
 
-async def _run_conversation(history: list[dict], use_web_search: bool):
+async def _run_conversation(history: list[dict], use_web_search: bool, document: dict | None):
     """Запрос к модели. Если ответ «встал на паузу» посреди поиска — продолжаем его."""
-    messages = list(history)
+    messages = _build_messages(history, document)
     response = await _create_message(messages, use_web_search)
     restarts = 0
     while response.stop_reason == "pause_turn" and restarts < MAX_PAUSE_RESTARTS:
@@ -166,49 +246,154 @@ def _extract_answer(response) -> str:
     return answer
 
 
-async def ask_claude(history: list[dict]) -> str:
-    """Отправляет историю в Claude и возвращает текст ответа.
+async def ask_claude(history: list[dict], document: dict | None = None) -> str:
+    """Отправляет историю (и документ, если есть) в Claude и возвращает текст ответа.
 
     Сначала пробуем с веб-поиском. Если поиск недоступен (например, не включён
     для аккаунта Anthropic) — повторяем запрос без него, чтобы бот всё равно ответил.
     """
     try:
-        response = await _run_conversation(history, use_web_search=True)
+        response = await _run_conversation(history, use_web_search=True, document=document)
     except anthropic.BadRequestError:
         logger.warning("Веб-поиск недоступен — отвечаю без него", exc_info=True)
-        response = await _run_conversation(history, use_web_search=False)
+        response = await _run_conversation(history, use_web_search=False, document=document)
     return _extract_answer(response)
 
 
 # --- Обработчики команд и сообщений --------------------------------------
 
+DENY_TEXT = "Извините, у вас нет доступа к этому боту."
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text(
-            "Извините, у вас нет доступа к этому боту."
-        )
+        await update.message.reply_text(DENY_TEXT)
         return
     await update.message.reply_text(
-        "Привет! Я отвечаю с помощью Claude. Просто напишите мне сообщение.\n"
-        "Команда /reset очистит историю нашего диалога."
+        "Привет! Я отвечаю с помощью Claude.\n\n"
+        "• просто напишите сообщение — отвечу, при необходимости поищу в интернете;\n"
+        "• пришлите файл PDF, DOCX или TXT — и задавайте вопросы по нему;\n"
+        "• /reset — очистить историю диалога;\n"
+        "• /forget — убрать документ из контекста."
     )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text(
-            "Извините, у вас нет доступа к этому боту."
-        )
+        await update.message.reply_text(DENY_TEXT)
         return
     conversations.pop(update.effective_user.id, None)
     await update.message.reply_text("История диалога очищена.")
 
 
+async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    removed = documents.pop(update.effective_user.id, None)
+    if removed:
+        await update.message.reply_text(
+            f"Документ «{removed['filename']}» убран из контекста."
+        )
+    else:
+        await update.message.reply_text("Сейчас в контексте нет документа.")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+
+    tg_doc = update.message.document
+    filename = tg_doc.file_name or "файл"
+    extension = os.path.splitext(filename)[1].lower()
+
+    if extension not in SUPPORTED_EXTENSIONS:
+        await update.message.reply_text(
+            f"Формат «{extension or '?'}» не поддерживается. "
+            "Пришлите, пожалуйста, файл PDF, DOCX или TXT."
+        )
+        return
+
+    # Предварительная проверка размера (Telegram сообщает его заранее).
+    if tg_doc.file_size and tg_doc.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text(
+            f"Файл слишком большой ({human_size(tg_doc.file_size)}). "
+            f"Максимум — {MAX_FILE_SIZE_MB} МБ."
+        )
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    )
+
+    try:
+        tg_file = await tg_doc.get_file()
+        data = bytes(await tg_file.download_as_bytearray())
+    except Exception:
+        logger.exception("Не удалось скачать файл из Telegram")
+        await update.message.reply_text(
+            "Не получилось скачать файл. Попробуйте прислать его ещё раз."
+        )
+        return
+
+    if len(data) > MAX_FILE_SIZE:
+        await update.message.reply_text(
+            f"Файл слишком большой ({human_size(len(data))}). "
+            f"Максимум — {MAX_FILE_SIZE_MB} МБ."
+        )
+        return
+
+    try:
+        text = extract_text(extension, data)
+    except Exception:
+        logger.exception("Ошибка извлечения текста из %s", filename)
+        await update.message.reply_text(
+            "Не удалось прочитать содержимое файла. "
+            "Возможно, он повреждён или защищён паролем."
+        )
+        return
+
+    if not text.strip():
+        await update.message.reply_text(
+            "В файле не нашлось текста. Если это скан или картинки — "
+            "распознавание пока не поддерживается."
+        )
+        return
+
+    note = ""
+    if len(text) > MAX_DOC_CHARS:
+        text = text[:MAX_DOC_CHARS]
+        note = (
+            f"\n\n⚠️ Документ большой — модели передана только первая часть "
+            f"(~{MAX_DOC_CHARS // 1000} тыс. символов)."
+        )
+
+    documents[update.effective_user.id] = {
+        "filename": filename,
+        "text": text,
+        "size": len(data),
+    }
+
+    await update.message.reply_text(
+        f"Файл «{filename}» принят ({human_size(len(data))}). "
+        f"Теперь задавайте вопросы по нему. /forget — убрать документ." + note
+    )
+
+
+async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фото, аудио, видео и прочее, что бот пока не умеет читать."""
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    await update.message.reply_text(
+        "Пока я умею работать только с текстом и файлами PDF, DOCX и TXT."
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
-        await update.message.reply_text(
-            "Извините, у вас нет доступа к этому боту."
-        )
+        await update.message.reply_text(DENY_TEXT)
         logger.info(
             "Отказано в доступе: id=%s username=%s",
             update.effective_user.id if update.effective_user else "?",
@@ -223,13 +408,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     history = conversations.setdefault(user_id, [])
     history.append({"role": "user", "content": user_text})
 
+    # Документ этого пользователя (если он присылал файл) — уйдёт модели вместе с историей.
+    document = documents.get(user_id)
+
     # Показываем «печатает...» пока ждём ответ модели.
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
     try:
-        answer = await ask_claude(history)
+        answer = await ask_claude(history, document)
     except anthropic.APIStatusError as e:
         logger.exception("Ошибка Anthropic API")
         # Убираем последнее сообщение пользователя, чтобы не копить «висящие» реплики.
@@ -290,7 +478,12 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("forget", forget))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.VOICE, handle_unsupported)
+    )
     app.add_error_handler(on_error)
 
     logger.info("Бот запущен. Разрешённые пользователи: %s", sorted(ALLOWED_USERS))
