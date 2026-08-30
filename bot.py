@@ -45,9 +45,30 @@ MAX_HISTORY_MESSAGES = 20
 # Максимальная длина ответа модели (в токенах).
 MAX_TOKENS = 2000
 
+# --- Веб-поиск -----------------------------------------------------------
+# Модель сама решает, искать ли в интернете или ответить по памяти.
+# max_uses ограничивает число поисков на один запрос пользователя —
+# это защищает от лишних трат.
+MAX_WEB_SEARCHES = 3
+
+WEB_SEARCH_TOOL = {
+    "type": "web_search_20260209",
+    "name": "web_search",
+    "max_uses": MAX_WEB_SEARCHES,
+}
+
+# Сколько раз повторно запросить модель, если длинный поиск «встал на паузу»
+# (stop_reason == "pause_turn").
+MAX_PAUSE_RESTARTS = 3
+
+# Telegram не принимает сообщения длиннее 4096 символов.
+TELEGRAM_MAX_LEN = 4000
+
 SYSTEM_PROMPT = (
     "Ты дружелюбный ассистент в Telegram. Отвечай кратко и по делу, "
-    "на том же языке, на котором пишет пользователь."
+    "на том же языке, на котором пишет пользователь. "
+    "Если вопрос требует свежих или проверяемых фактов — используй веб-поиск. "
+    "Если ответ ты и так знаешь — отвечай сразу, без поиска."
 )
 
 
@@ -90,17 +111,73 @@ def is_allowed(update: Update) -> bool:
     return user is not None and user.id in ALLOWED_USERS
 
 
-async def ask_claude(history: list[dict]) -> str:
-    """Отправляет историю в Claude и возвращает текст ответа."""
-    response = await claude.messages.create(
+async def _create_message(messages: list[dict], use_web_search: bool):
+    kwargs = dict(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=SYSTEM_PROMPT,
-        messages=history,
+        messages=messages,
     )
-    # Ответ приходит списком блоков; берём текстовые и склеиваем.
-    parts = [block.text for block in response.content if block.type == "text"]
-    return "\n".join(parts).strip() or "(пустой ответ от модели)"
+    if use_web_search:
+        kwargs["tools"] = [WEB_SEARCH_TOOL]
+    return await claude.messages.create(**kwargs)
+
+
+async def _run_conversation(history: list[dict], use_web_search: bool):
+    """Запрос к модели. Если ответ «встал на паузу» посреди поиска — продолжаем его."""
+    messages = list(history)
+    response = await _create_message(messages, use_web_search)
+    restarts = 0
+    while response.stop_reason == "pause_turn" and restarts < MAX_PAUSE_RESTARTS:
+        messages = messages + [{"role": "assistant", "content": response.content}]
+        response = await _create_message(messages, use_web_search)
+        restarts += 1
+    return response
+
+
+def _extract_answer(response) -> str:
+    """Собирает текст ответа и список источников (ссылок), на которые сослалась модель."""
+    text_parts: list[str] = []
+    sources: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for block in response.content:
+        if block.type != "text":
+            continue
+        if block.text:
+            text_parts.append(block.text)
+        # У текстовых блоков после веб-поиска есть citations со ссылками на источники.
+        for citation in getattr(block, "citations", None) or []:
+            url = getattr(citation, "url", None)
+            if url and url not in seen:
+                seen.add(url)
+                sources.append((getattr(citation, "title", None) or url, url))
+
+    answer = "\n".join(text_parts).strip() or "(пустой ответ от модели)"
+
+    if sources:
+        links = "\n".join(
+            f"{i}. {title}\n{url}" for i, (title, url) in enumerate(sources, 1)
+        )
+        answer = f"{answer}\n\nИсточники:\n{links}"
+
+    if len(answer) > TELEGRAM_MAX_LEN:
+        answer = answer[:TELEGRAM_MAX_LEN] + "…"
+    return answer
+
+
+async def ask_claude(history: list[dict]) -> str:
+    """Отправляет историю в Claude и возвращает текст ответа.
+
+    Сначала пробуем с веб-поиском. Если поиск недоступен (например, не включён
+    для аккаунта Anthropic) — повторяем запрос без него, чтобы бот всё равно ответил.
+    """
+    try:
+        response = await _run_conversation(history, use_web_search=True)
+    except anthropic.BadRequestError:
+        logger.warning("Веб-поиск недоступен — отвечаю без него", exc_info=True)
+        response = await _run_conversation(history, use_web_search=False)
+    return _extract_answer(response)
 
 
 # --- Обработчики команд и сообщений --------------------------------------
