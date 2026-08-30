@@ -12,5 +12,11 @@ venv/
 *.log
 .DS_Store
 
+# База с историей переписки — личное, не коммитить
+history.db
+history.db-journal
+history.db-wal
+history.db-shm
+
 # Локальные настройки Claude Code
 .claude/settings.local.json

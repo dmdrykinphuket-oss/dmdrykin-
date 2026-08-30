@@ -4,13 +4,16 @@
 Что делает:
 - отвечает только пользователям, чьи Telegram ID указаны в ALLOWED_USERS (.env),
   остальным — вежливый отказ;
-- хранит историю диалога отдельно для каждого пользователя (последние 20 сообщений);
+- хранит всю историю диалога в SQLite (файл history.db рядом с ботом), отдельно
+  по каждому пользователю; модели передаёт последние 20 сообщений;
+- при перезапуске продолжает диалог с того места, где остановились;
 - принимает файлы PDF, DOCX и TXT: извлекает текст и держит документ в контексте,
   пока пользователь задаёт по нему вопросы;
 - принимает голосовые и аудиофайлы (m4a, mp3, …), в том числе присланные
   документом: расшифровывает их локально через faster-whisper (модель small,
   русский язык) и обрабатывает как обычный текст;
-- команда /reset очищает историю, /forget убирает документ из контекста;
+- команда /reset очищает историю пользователя, /history показывает её размер,
+  /forget убирает документ из контекста;
 - умеет искать в интернете (web_search) и показывает ссылки на источники;
 - если Anthropic API вернул ошибку — бот пишет об этом в чат и продолжает работать.
 
@@ -22,6 +25,7 @@ import html
 import io
 import logging
 import os
+import sqlite3
 import threading
 
 from anthropic import AsyncAnthropic
@@ -50,9 +54,14 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 # Модель Claude, через которую отвечает бот.
 MODEL = "claude-sonnet-5"
 
-# Сколько последних сообщений хранить в истории каждого пользователя.
+# Сколько последних сообщений передавать модели в контексте.
 # 20 сообщений = примерно 10 реплик пользователя и 10 ответов бота.
+# (В базе хранится ВСЯ история — это только окно, которое видит модель.)
 MAX_HISTORY_MESSAGES = 20
+
+# Файл базы данных с историей — рядом с bot.py, чтобы путь не зависел от того,
+# из какой папки запущен бот.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
 
 # Максимальная длина ответа модели (в токенах).
 MAX_TOKENS = 2000
@@ -138,17 +147,82 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpx2").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# --- Клиент Anthropic и хранилище истории --------------------------------
+# --- Клиент Anthropic ---------------------------------------------------
 
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-# История диалогов: {telegram_id: [ {"role": "user"/"assistant", "content": "..."} ]}
-# Хранится в оперативной памяти — после перезапуска бота история очищается.
-conversations: dict[int, list[dict]] = {}
-
-# Активный документ каждого пользователя:
+# Активный документ каждого пользователя (в памяти, при перезапуске сбрасывается):
 # {telegram_id: {"filename": str, "text": str, "size": int (байт)}}
 documents: dict[int, dict] = {}
+
+
+# --- История диалогов: SQLite -----------------------------------------
+# Вся переписка хранится в файле DB_PATH и переживает перезапуск бота.
+
+_db: sqlite3.Connection | None = None
+
+
+def get_db() -> sqlite3.Connection:
+    """Возвращает подключение к базе, создавая файл и таблицу при первом вызове."""
+    global _db
+    if _db is None:
+        _db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _db.row_factory = sqlite3.Row
+        _db.execute("PRAGMA journal_mode=WAL")
+        _db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                role       TEXT    NOT NULL,   -- 'user' | 'assistant'
+                content    TEXT    NOT NULL,
+                created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        _db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id)"
+        )
+        _db.commit()
+    return _db
+
+
+def db_add_message(user_id: int, role: str, content: str) -> None:
+    db = get_db()
+    db.execute(
+        "INSERT INTO messages (user_id, role, content) VALUES (?, ?, ?)",
+        (user_id, role, content),
+    )
+    db.commit()
+
+
+def db_recent_messages(user_id: int, limit: int) -> list[dict]:
+    """Последние `limit` сообщений пользователя в хронологическом порядке."""
+    rows = get_db().execute(
+        "SELECT role, content FROM messages WHERE user_id = ? "
+        "ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    messages = [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    # Первым сообщением для модели обязано быть сообщение пользователя.
+    while messages and messages[0]["role"] != "user":
+        messages.pop(0)
+    return messages
+
+
+def db_count_messages(user_id: int) -> int:
+    return get_db().execute(
+        "SELECT COUNT(*) AS n FROM messages WHERE user_id = ?", (user_id,)
+    ).fetchone()["n"]
+
+
+def db_clear_user(user_id: int) -> int:
+    db = get_db()
+    deleted = db.execute(
+        "DELETE FROM messages WHERE user_id = ?", (user_id,)
+    ).rowcount
+    db.commit()
+    return deleted
 
 
 def is_allowed(update: Update) -> bool:
@@ -340,6 +414,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• просто напишите сообщение — отвечу, при необходимости поищу в интернете;\n"
         "• пришлите файл PDF, DOCX или TXT — и задавайте вопросы по нему;\n"
         "• запишите голосовое или пришлите аудиофайл — я расшифрую и отвечу;\n"
+        "• /history — сколько сообщений сохранено;\n"
         "• /reset — очистить историю диалога;\n"
         "• /forget — убрать документ из контекста."
     )
@@ -349,8 +424,25 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return
-    conversations.pop(update.effective_user.id, None)
-    await update.message.reply_text("История диалога очищена.")
+    deleted = db_clear_user(update.effective_user.id)
+    await update.message.reply_text(
+        f"История диалога очищена (удалено сообщений: {deleted})."
+    )
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    total = db_count_messages(update.effective_user.id)
+    if total == 0:
+        await update.message.reply_text("История пуста.")
+        return
+    shown = min(total, MAX_HISTORY_MESSAGES)
+    await update.message.reply_text(
+        f"В истории сохранено сообщений: {total}.\n"
+        f"Модели передаю последние {shown}."
+    )
 
 
 async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -461,13 +553,17 @@ async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def get_model_answer(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, user_text: str
 ) -> str | None:
-    """Добавляет вопрос в историю, спрашивает модель, обрезает историю.
+    """Спрашивает модель по истории из БД и сохраняет обе реплики.
 
-    При ошибке сам пишет пояснение в чат и возвращает None (бот не падает).
+    В БД пишем только после успешного ответа — тогда «висящих» вопросов
+    без ответа не остаётся. При ошибке сам пишет пояснение в чат и возвращает
+    None (бот не падает).
     """
-    history = conversations.setdefault(user_id, [])
-    history.append({"role": "user", "content": user_text})
     document = documents.get(user_id)
+
+    # Контекст для модели: последние сообщения из БД + текущий вопрос.
+    history = db_recent_messages(user_id, MAX_HISTORY_MESSAGES - 1)
+    history.append({"role": "user", "content": user_text})
 
     if LOG_DIALOG:
         doc_note = f" [документ: {document['filename']}]" if document else ""
@@ -481,7 +577,6 @@ async def get_model_answer(
         answer = await ask_claude(history, document)
     except anthropic.APIStatusError as e:
         logger.exception("Ошибка Anthropic API")
-        history.pop()  # убираем «висящий» вопрос без ответа
         await update.message.reply_text(
             f"Ошибка при обращении к Claude (код {e.status_code}). "
             "Попробуйте ещё раз чуть позже."
@@ -489,22 +584,19 @@ async def get_model_answer(
         return None
     except anthropic.APIConnectionError:
         logger.exception("Проблема сети при обращении к Anthropic")
-        history.pop()
         await update.message.reply_text(
             "Не удалось связаться с Claude (проблема сети). Попробуйте ещё раз."
         )
         return None
     except Exception:
         logger.exception("Непредвиденная ошибка при обращении к Claude")
-        history.pop()
         await update.message.reply_text(
             "Что-то пошло не так при обращении к Claude. Попробуйте ещё раз позже."
         )
         return None
 
-    history.append({"role": "assistant", "content": answer})
-    if len(history) > MAX_HISTORY_MESSAGES:
-        del history[:-MAX_HISTORY_MESSAGES]
+    db_add_message(user_id, "user", user_text)
+    db_add_message(user_id, "assistant", answer)
 
     if LOG_DIALOG:
         logger.info("[%s] бот: %s", user_id, answer)
@@ -663,10 +755,21 @@ def main() -> None:
             "Список ALLOWED_USERS пуст. Впишите в .env хотя бы один Telegram ID."
         )
 
+    # Открываем базу истории и показываем, что в ней уже есть.
+    db = get_db()
+    stats = db.execute(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT user_id) AS u FROM messages"
+    ).fetchone()
+    logger.info(
+        "История: %s сообщений от %s пользователей (%s)",
+        stats["n"], stats["u"], DB_PATH,
+    )
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("forget", forget))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
