@@ -7,6 +7,8 @@
 - хранит историю диалога отдельно для каждого пользователя (последние 20 сообщений);
 - принимает файлы PDF, DOCX и TXT: извлекает текст и держит документ в контексте,
   пока пользователь задаёт по нему вопросы;
+- принимает голосовые: расшифровывает их локально через faster-whisper (модель
+  small, русский язык) и обрабатывает как обычный текст;
 - команда /reset очищает историю, /forget убирает документ из контекста;
 - умеет искать в интернете (web_search) и показывает ссылки на источники;
 - если Anthropic API вернул ошибку — бот пишет об этом в чат и продолжает работать.
@@ -14,9 +16,12 @@
 Токены читаются из файла .env и в коде не хранятся.
 """
 
+import asyncio
+import html
 import io
 import logging
 import os
+import threading
 
 from anthropic import AsyncAnthropic
 import anthropic
@@ -24,7 +29,7 @@ import docx
 import pypdf
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -82,6 +87,16 @@ MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 # Максимум символов текста из документа, который уходит модели.
 # Защищает от гигантских документов и лишних трат (~30 000 токенов).
 MAX_DOC_CHARS = 120_000
+
+# --- Голосовые сообщения ----------------------------------------------
+# Расшифровка идёт локально через faster-whisper (модель small, русский язык).
+# Модель (~460 МБ) скачивается один раз при первом голосовом и кэшируется.
+WHISPER_MODEL_SIZE = "small"
+WHISPER_LANGUAGE = "ru"
+
+# Максимальная длительность голосового. Длиннее — бот вежливо откажет
+# (расшифровка долгих записей занимает много времени и памяти).
+MAX_VOICE_SECONDS = 120
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный ассистент в Telegram. Отвечай кратко и по делу, "
@@ -155,6 +170,42 @@ def extract_text(extension: str, data: bytes) -> str:
     if extension == ".txt":
         return data.decode("utf-8", errors="replace")
     raise ValueError(f"Формат {extension} не поддерживается")
+
+
+# --- Распознавание речи (faster-whisper) --------------------------------
+# Модель тяжёлая, поэтому грузим её один раз и лениво — при первом голосовом.
+_whisper_model = None
+_whisper_lock = threading.Lock()
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        with _whisper_lock:
+            if _whisper_model is None:
+                from faster_whisper import WhisperModel
+
+                logger.info(
+                    "Загружаю модель распознавания речи faster-whisper (%s)…",
+                    WHISPER_MODEL_SIZE,
+                )
+                _whisper_model = WhisperModel(
+                    WHISPER_MODEL_SIZE, device="cpu", compute_type="int8"
+                )
+                logger.info("Модель распознавания речи готова.")
+    return _whisper_model
+
+
+def transcribe_voice(audio_bytes: bytes) -> str:
+    """Расшифровывает аудио (bytes) в текст. Блокирующая операция — звать через to_thread."""
+    model = _get_whisper_model()
+    segments, _info = model.transcribe(
+        io.BytesIO(audio_bytes),
+        language=WHISPER_LANGUAGE,
+        beam_size=5,
+        vad_filter=True,  # отсекает тишину и шум по краям
+    )
+    return " ".join(segment.text.strip() for segment in segments).strip()
 
 
 def _build_messages(history: list[dict], document: dict | None) -> list[dict]:
@@ -273,6 +324,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! Я отвечаю с помощью Claude.\n\n"
         "• просто напишите сообщение — отвечу, при необходимости поищу в интернете;\n"
         "• пришлите файл PDF, DOCX или TXT — и задавайте вопросы по нему;\n"
+        "• запишите голосовое — я расшифрую его и отвечу;\n"
         "• /reset — очистить историю диалога;\n"
         "• /forget — убрать документ из контекста."
     )
@@ -391,6 +443,52 @@ async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def get_model_answer(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, user_text: str
+) -> str | None:
+    """Добавляет вопрос в историю, спрашивает модель, обрезает историю.
+
+    При ошибке сам пишет пояснение в чат и возвращает None (бот не падает).
+    """
+    history = conversations.setdefault(user_id, [])
+    history.append({"role": "user", "content": user_text})
+    document = documents.get(user_id)
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    )
+
+    try:
+        answer = await ask_claude(history, document)
+    except anthropic.APIStatusError as e:
+        logger.exception("Ошибка Anthropic API")
+        history.pop()  # убираем «висящий» вопрос без ответа
+        await update.message.reply_text(
+            f"Ошибка при обращении к Claude (код {e.status_code}). "
+            "Попробуйте ещё раз чуть позже."
+        )
+        return None
+    except anthropic.APIConnectionError:
+        logger.exception("Проблема сети при обращении к Anthropic")
+        history.pop()
+        await update.message.reply_text(
+            "Не удалось связаться с Claude (проблема сети). Попробуйте ещё раз."
+        )
+        return None
+    except Exception:
+        logger.exception("Непредвиденная ошибка при обращении к Claude")
+        history.pop()
+        await update.message.reply_text(
+            "Что-то пошло не так при обращении к Claude. Попробуйте ещё раз позже."
+        )
+        return None
+
+    history.append({"role": "assistant", "content": answer})
+    if len(history) > MAX_HISTORY_MESSAGES:
+        del history[:-MAX_HISTORY_MESSAGES]
+    return answer
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
@@ -401,54 +499,78 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    user_id = update.effective_user.id
-    user_text = update.message.text
+    answer = await get_model_answer(
+        update, context, update.effective_user.id, update.message.text
+    )
+    if answer is not None:
+        await update.message.reply_text(answer)
 
-    # Достаём историю пользователя и добавляем новое сообщение.
-    history = conversations.setdefault(user_id, [])
-    history.append({"role": "user", "content": user_text})
 
-    # Документ этого пользователя (если он присылал файл) — уйдёт модели вместе с историей.
-    document = documents.get(user_id)
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
 
-    # Показываем «печатает...» пока ждём ответ модели.
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    voice = update.message.voice
+    if voice.duration and voice.duration > MAX_VOICE_SECONDS:
+        await update.message.reply_text(
+            f"Голосовое слишком длинное ({voice.duration} с). "
+            f"Максимум — {MAX_VOICE_SECONDS} с. Разбейте на части или напишите текстом."
+        )
+        return
+
+    status = await update.message.reply_text(
+        "🎧 Расшифровываю голосовое… это не мгновенно, подождите минуту."
     )
 
     try:
-        answer = await ask_claude(history, document)
-    except anthropic.APIStatusError as e:
-        logger.exception("Ошибка Anthropic API")
-        # Убираем последнее сообщение пользователя, чтобы не копить «висящие» реплики.
-        history.pop()
-        await update.message.reply_text(
-            f"Ошибка при обращении к Claude (код {e.status_code}). "
-            "Попробуйте ещё раз чуть позже."
-        )
-        return
-    except anthropic.APIConnectionError:
-        logger.exception("Проблема сети при обращении к Anthropic")
-        history.pop()
-        await update.message.reply_text(
-            "Не удалось связаться с Claude (проблема сети). Попробуйте ещё раз."
-        )
-        return
+        tg_file = await voice.get_file()
+        audio_bytes = bytes(await tg_file.download_as_bytearray())
     except Exception:
-        logger.exception("Непредвиденная ошибка при обращении к Claude")
-        history.pop()
-        await update.message.reply_text(
-            "Что-то пошло не так при обращении к Claude. Попробуйте ещё раз позже."
+        logger.exception("Не удалось скачать голосовое из Telegram")
+        await status.edit_text("Не удалось скачать голосовое сообщение. Попробуйте ещё раз.")
+        return
+
+    try:
+        recognized = await asyncio.to_thread(transcribe_voice, audio_bytes)
+    except Exception:
+        logger.exception("Ошибка расшифровки голосового")
+        await status.edit_text(
+            "Не удалось расшифровать голосовое сообщение. "
+            "Попробуйте записать ещё раз или напишите текстом."
         )
         return
 
-    history.append({"role": "assistant", "content": answer})
+    recognized = (recognized or "").strip()
+    if not recognized:
+        await status.edit_text(
+            "В этом голосовом не удалось разобрать речь. "
+            "Попробуйте записать в тишине или напишите текстом."
+        )
+        return
 
-    # Обрезаем историю до последних MAX_HISTORY_MESSAGES сообщений.
-    if len(history) > MAX_HISTORY_MESSAGES:
-        del history[:-MAX_HISTORY_MESSAGES]
+    # Убираем статус — дальше будет обычный ответ.
+    try:
+        await status.delete()
+    except Exception:
+        pass
 
-    await update.message.reply_text(answer)
+    # Показываем распознанный текст курсивом — чтобы было видно ошибки распознавания.
+    # (Модель получит полный текст; в чате показываем максимум ~3500 символов.)
+    shown = recognized if len(recognized) <= 3500 else recognized[:3500] + "…"
+    try:
+        await update.message.reply_text(
+            f"🎙 <i>{html.escape(shown)}</i>", parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        await update.message.reply_text(f"🎙 Распознано: {shown}")
+
+    # Дальше — ровно как с обычным текстовым сообщением.
+    answer = await get_model_answer(
+        update, context, update.effective_user.id, recognized
+    )
+    if answer is not None:
+        await update.message.reply_text(answer)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,11 +602,16 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("forget", forget))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(
-        MessageHandler(filters.PHOTO | filters.AUDIO | filters.VIDEO | filters.VOICE, handle_unsupported)
+        MessageHandler(filters.PHOTO | filters.AUDIO | filters.VIDEO, handle_unsupported)
     )
     app.add_error_handler(on_error)
+
+    # Заранее греем модель распознавания речи в фоне, чтобы первое голосовое
+    # не ждало загрузки модели.
+    threading.Thread(target=_get_whisper_model, daemon=True).start()
 
     logger.info("Бот запущен. Разрешённые пользователи: %s", sorted(ALLOWED_USERS))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
