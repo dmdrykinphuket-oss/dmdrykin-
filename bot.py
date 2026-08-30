@@ -98,6 +98,11 @@ WHISPER_LANGUAGE = "ru"
 # (расшифровка долгих записей занимает много времени и памяти).
 MAX_VOICE_SECONDS = 120
 
+# --- Логирование диалога ----------------------------------------------
+# Если True — весь диалог (сообщения пользователя и ответы Claude) пишется
+# в лог целиком, открытым текстом. Поставьте False, чтобы отключить.
+LOG_DIALOG = True
+
 SYSTEM_PROMPT = (
     "Ты дружелюбный ассистент в Telegram. Отвечай кратко и по делу, "
     "на том же языке, на котором пишет пользователь. "
@@ -454,6 +459,10 @@ async def get_model_answer(
     history.append({"role": "user", "content": user_text})
     document = documents.get(user_id)
 
+    if LOG_DIALOG:
+        doc_note = f" [документ: {document['filename']}]" if document else ""
+        logger.info("[%s] пользователь%s: %s", user_id, doc_note, user_text)
+
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
@@ -486,6 +495,9 @@ async def get_model_answer(
     history.append({"role": "assistant", "content": answer})
     if len(history) > MAX_HISTORY_MESSAGES:
         del history[:-MAX_HISTORY_MESSAGES]
+
+    if LOG_DIALOG:
+        logger.info("[%s] бот: %s", user_id, answer)
     return answer
 
 
