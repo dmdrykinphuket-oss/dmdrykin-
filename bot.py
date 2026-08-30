@@ -434,12 +434,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фото, аудио, видео и прочее, что бот пока не умеет читать."""
+    """Фото, аудио-файлы, видео и прочее, что бот пока не умеет читать."""
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return
     await update.message.reply_text(
-        "Пока я умею работать только с текстом и файлами PDF, DOCX и TXT."
+        "Пока я умею работать только с текстом, голосовыми и файлами PDF, DOCX и TXT."
     )
 
 
@@ -512,6 +512,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     voice = update.message.voice
+    logger.info(
+        "Голосовое получено: duration=%s size=%s mime=%s",
+        voice.duration, voice.file_size, voice.mime_type,
+    )
     if voice.duration and voice.duration > MAX_VOICE_SECONDS:
         await update.message.reply_text(
             f"Голосовое слишком длинное ({voice.duration} с). "
@@ -531,6 +535,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await status.edit_text("Не удалось скачать голосовое сообщение. Попробуйте ещё раз.")
         return
 
+    logger.info("Голосовое скачано: %s байт, начинаю расшифровку", len(audio_bytes))
     try:
         recognized = await asyncio.to_thread(transcribe_voice, audio_bytes)
     except Exception:
@@ -541,6 +546,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    logger.info("Расшифровка готова: %r", (recognized or "")[:200])
     recognized = (recognized or "").strip()
     if not recognized:
         await status.edit_text(
@@ -614,7 +620,7 @@ def main() -> None:
     threading.Thread(target=_get_whisper_model, daemon=True).start()
 
     logger.info("Бот запущен. Разрешённые пользователи: %s", sorted(ALLOWED_USERS))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
