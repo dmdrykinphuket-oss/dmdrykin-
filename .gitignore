@@ -1,0 +1,16 @@
+# Секреты — никогда не коммитить!
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Логи и прочее
+*.log
+.DS_Store
+
+# Локальные настройки Claude Code
+.claude/settings.local.json
