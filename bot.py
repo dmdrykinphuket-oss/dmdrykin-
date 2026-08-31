@@ -14,6 +14,12 @@
   русский), затем прогоняет текст через claude-sonnet-5 — чистит орфографию,
   пунктуацию, слова-паразиты, разбивает на абзацы; для длинных записей добавляет
   структурное резюме. Сырая расшифровка не выводится, доступна по /raw;
+- команда /tr включает режим перевода: следующие текстовые сообщения и
+  документы переводятся claude-sonnet-5, а не обсуждаются; направление
+  перевода определяется автоматически по языку исходного текста; форматирование,
+  абзацы и нумерация сохраняются, перевод полный (без сокращений и пересказа);
+  длинные тексты режутся на части, но переводятся с общим контекстом, чтобы
+  терминология не расходилась; /tr off выключает режим;
 - команда /reset очищает историю пользователя, /history показывает её размер,
   /raw показывает сырую расшифровку последнего аудио,
   /forget убирает документ из контекста;
@@ -101,6 +107,13 @@ MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 # Защищает от гигантских документов и лишних трат (~30 000 токенов).
 MAX_DOC_CHARS = 120_000
 
+# --- Режим перевода (/tr) ------------------------------------------------
+# Длинные тексты режем на части такого размера (по границам абзацев) и
+# переводим по очереди, но в одной «сессии» — прошлые фрагменты и их перевод
+# остаются в контексте, чтобы терминология не расходилась между частями.
+TRANSLATE_CHUNK_CHARS = 6000
+TRANSLATE_MAX_TOKENS = 4096
+
 # --- Голосовые сообщения ----------------------------------------------
 # Расшифровка идёт локально через faster-whisper (модель small, русский язык).
 # Модель (~460 МБ) скачивается один раз при первом голосовом и кэшируется.
@@ -168,6 +181,10 @@ documents: dict[int, dict] = {}
 # Сырая расшифровка последнего аудио каждого пользователя — для команды /raw
 # (в памяти; в чат не выводится).
 raw_transcripts: dict[int, str] = {}
+
+# Кто сейчас в режиме перевода (/tr): {telegram_id: True}.
+# В памяти, при перезапуске сбрасывается — как documents и raw_transcripts.
+translate_mode: dict[int, bool] = {}
 
 
 # --- История диалогов: SQLite -----------------------------------------
@@ -430,6 +447,110 @@ async def process_transcript(raw: str) -> str:
     return "\n\n".join(parts)
 
 
+# --- Режим перевода (/tr) ------------------------------------------------
+
+TRANSLATE_SYSTEM = (
+    "Ты профессиональный переводчик. Твоя единственная задача — переводить "
+    "присланный текст, ничего не обсуждая, не отвечая на вопросы в нём и не "
+    "комментируя содержание.\n\n"
+    "Направление перевода определяй автоматически по языку исходного текста: "
+    "если текст на русском — переводи на английский; если текст на любом "
+    "другом языке — переводи на русский.\n\n"
+    "Правила:\n"
+    "• переводи текст ПОЛНОСТЬЮ — ничего не сокращай, не пересказывай и не "
+    "пропускай;\n"
+    "• сохраняй форматирование, разбивку на абзацы и нумерацию исходника;\n"
+    "• имена людей, названия компаний и денежные суммы оставляй как в "
+    "оригинале — не транслитерируй и не конвертируй;\n"
+    "• для юридических и деловых текстов используй единообразную "
+    "терминологию по всему документу и не смягчай формулировки;\n"
+    "• если термин допускает несколько переводов и выбор варианта влияет на "
+    "смысл — сразу после перевода этого места добавь отдельную строку вида "
+    "«⚠️ [термин]: возможны варианты — …» с кратким пояснением;\n"
+    "• если тебе прислали один фрагмент длинного документа — переводи только "
+    "его, опираясь на предыдущие фрагменты и их перевод в истории диалога, "
+    "чтобы терминология не расходилась между частями;\n"
+    "• в ответе — только перевод (и, если нужно, пояснения по неоднозначным "
+    "терминам отдельными строками), без вступлений и комментариев от себя."
+)
+
+
+def split_for_translation(text: str, max_chars: int) -> list[str]:
+    """Режет текст на части ≤ max_chars по границам абзацев (не разрывая их),
+    если только сам абзац не длиннее лимита — тогда режет его жёстко."""
+    chunks: list[str] = []
+    current = ""
+    for para in text.split("\n\n"):
+        if len(para) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+            for start in range(0, len(para), max_chars):
+                chunks.append(para[start:start + max_chars])
+            continue
+        candidate = f"{current}\n\n{para}" if current else para
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = para
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def translate_text(text: str, on_progress=None) -> str:
+    """Переводит текст через claude-sonnet-5. Длинный текст режет на части и
+    переводит их по очереди в одной сессии — каждая следующая часть видит в
+    контексте предыдущие фрагменты и их перевод, чтобы термины не расходились.
+    """
+    chunks = split_for_translation(text, TRANSLATE_CHUNK_CHARS)
+    messages: list[dict] = []
+    translated_parts: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        if on_progress:
+            await on_progress(i, len(chunks))
+        messages.append({"role": "user", "content": chunk})
+        response = await claude.messages.create(
+            model=MODEL,
+            max_tokens=TRANSLATE_MAX_TOKENS,
+            system=TRANSLATE_SYSTEM,
+            messages=messages,
+        )
+        translated = "\n".join(
+            b.text for b in response.content if b.type == "text"
+        ).strip()
+        messages.append({"role": "assistant", "content": translated})
+        translated_parts.append(translated)
+    return "\n\n".join(translated_parts)
+
+
+async def run_translation(update: Update, text: str, on_progress=None) -> str | None:
+    """Переводит текст и ловит ошибки API так же, как обычные ответы модели.
+    При ошибке сам пишет пояснение в чат и возвращает None."""
+    try:
+        return await translate_text(text, on_progress=on_progress)
+    except anthropic.APIStatusError as e:
+        logger.exception("Ошибка Anthropic API при переводе")
+        await update.message.reply_text(
+            f"Ошибка при обращении к Claude (код {e.status_code}). "
+            "Попробуйте ещё раз чуть позже."
+        )
+        return None
+    except anthropic.APIConnectionError:
+        logger.exception("Проблема сети при переводе")
+        await update.message.reply_text(
+            "Не удалось связаться с Claude (проблема сети). Попробуйте ещё раз."
+        )
+        return None
+    except Exception:
+        logger.exception("Непредвиденная ошибка при переводе")
+        await update.message.reply_text(
+            "Что-то пошло не так при переводе. Попробуйте ещё раз позже."
+        )
+        return None
+
+
 async def _safe(coro) -> None:
     """Ждёт корутину и глотает сетевые ошибки — для косметических действий
     (правка/удаление статуса), сбой которых не должен ронять обработчик."""
@@ -595,10 +716,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• пришлите файл PDF, DOCX или TXT — и задавайте вопросы по нему;\n"
         "• запишите голосовое или пришлите аудиофайл — я расшифрую его, "
         "причешу текст и (если запись длинная) сделаю краткое резюме;\n"
+        "• /tr — включить режим перевода: сообщения и документы переводятся "
+        "вместо обсуждения, направление — по языку текста; /tr off — выключить;\n"
         "• /raw — сырая расшифровка последнего аудио;\n"
         "• /history — сколько сообщений сохранено;\n"
         "• /reset — очистить историю диалога;\n"
         "• /forget — убрать документ из контекста."
+    )
+
+
+async def tr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    user_id = update.effective_user.id
+    if context.args and context.args[0].lower() == "off":
+        was_on = translate_mode.pop(user_id, False)
+        await update.message.reply_text(
+            "Режим перевода выключен." if was_on
+            else "Режим перевода и так был выключен."
+        )
+        return
+    translate_mode[user_id] = True
+    await update.message.reply_text(
+        "Режим перевода включён 🌐\n"
+        "Присылайте текст или файл (PDF/DOCX/TXT) — переведу целиком, сохраняя "
+        "форматирование и нумерацию. Направление перевода определяю "
+        "автоматически по языку текста.\n"
+        "/tr off — выключить и вернуться к обычному режиму."
     )
 
 
@@ -654,6 +799,42 @@ async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         await update.message.reply_text("Сейчас в контексте нет документа.")
+
+
+async def handle_translate_document(
+    update: Update, user_id: int, filename: str, text: str
+) -> None:
+    """Переводит текст присланного документа целиком (режим /tr)."""
+    note = ""
+    if len(text) > MAX_DOC_CHARS:
+        text = text[:MAX_DOC_CHARS]
+        note = (
+            f"\n\n⚠️ Документ большой — переведена только первая часть "
+            f"(~{MAX_DOC_CHARS // 1000} тыс. символов)."
+        )
+
+    if LOG_DIALOG:
+        logger.info("[%s] перевод (документ «%s»): %s байт", user_id, filename, len(text))
+
+    status = None
+    try:
+        status = await update.message.reply_text(f"🌐 Перевожу «{filename}»…")
+    except Exception:
+        logger.warning("Не удалось отправить статус-сообщение", exc_info=True)
+
+    async def progress(i: int, total: int) -> None:
+        if status is not None and total > 1:
+            await _safe(status.edit_text(f"🌐 Перевожу «{filename}»… часть {i}/{total}"))
+
+    result = await run_translation(update, text, on_progress=progress)
+    if status is not None:
+        await _safe(status.delete())
+    if result is None:
+        return
+
+    await deliver(update.message, f"Перевод «{filename}»:\n\n{result}{note}")
+    if LOG_DIALOG:
+        logger.info("[%s] перевод результат («%s»): %s", user_id, filename, result)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -716,6 +897,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "В файле не нашлось текста. Если это скан или картинки — "
             "распознавание пока не поддерживается."
         )
+        return
+
+    user_id = update.effective_user.id
+    if translate_mode.get(user_id):
+        await handle_translate_document(update, user_id, filename, text)
         return
 
     note = ""
@@ -811,9 +997,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    answer = await get_model_answer(
-        update, context, update.effective_user.id, update.message.text
-    )
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    if translate_mode.get(user_id):
+        if LOG_DIALOG:
+            logger.info("[%s] перевод (текст): %s", user_id, text)
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action=ChatAction.TYPING
+        )
+        result = await run_translation(update, text)
+        if result is not None:
+            await deliver(update.message, result)
+            if LOG_DIALOG:
+                logger.info("[%s] перевод результат: %s", user_id, result)
+        return
+
+    answer = await get_model_answer(update, context, user_id, text)
     if answer is not None:
         await update.message.reply_text(answer)
 
@@ -989,6 +1189,7 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("tr", tr_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("raw", raw_cmd))
