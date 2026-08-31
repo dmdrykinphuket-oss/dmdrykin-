@@ -2064,6 +2064,12 @@ if __name__ == "__main__":
     while True:
         try:
             main()
+            # run_polling() сам ловит SIGINT/SIGTERM (Ctrl+C, systemctl
+            # stop/restart) и красиво завершается — это НЕ падение, поэтому
+            # main() просто возвращается без исключения. Перезапускать в
+            # этом же процессе нельзя: event loop уже закрыт, вторая попытка
+            # тут же упадёт с "Event loop is closed". Штатный выход — выходим.
+            break
         except KeyboardInterrupt:
             break
         except SystemExit:
