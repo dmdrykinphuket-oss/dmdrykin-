@@ -430,6 +430,31 @@ async def process_transcript(raw: str) -> str:
     return "\n\n".join(parts)
 
 
+async def _safe(coro) -> None:
+    """Ждёт корутину и глотает сетевые ошибки — для косметических действий
+    (правка/удаление статуса), сбой которых не должен ронять обработчик."""
+    try:
+        await coro
+    except Exception:
+        logger.debug("Второстепенное действие не удалось", exc_info=True)
+
+
+async def deliver(message, text: str, retries: int = 3) -> bool:
+    """Настойчиво отправляет ответ (важный результат). Возвращает True при успехе."""
+    for attempt in range(retries):
+        try:
+            await send_chunks(message, text)
+            return True
+        except Exception:
+            logger.warning(
+                "Не удалось отправить ответ (попытка %s/%s)", attempt + 1, retries,
+                exc_info=True,
+            )
+            await asyncio.sleep(2 * (attempt + 1))
+    logger.error("Ответ так и не отправлен, текст: %s", text[:500])
+    return False
+
+
 async def send_chunks(message, text: str) -> None:
     """Отправляет длинный текст, разбивая по абзацам на части ≤ 4096 символов."""
     limit = 4096
@@ -824,20 +849,31 @@ async def _transcribe_and_reply(
         )
         return
 
-    status = await update.message.reply_text(
-        f"🎧 Расшифровываю ({kind.lower()})… это не мгновенно, подождите минуту."
-    )
+    status = None
+    try:
+        status = await update.message.reply_text(
+            f"🎧 Расшифровываю ({kind.lower()})… это не мгновенно, подождите минуту."
+        )
+    except Exception:
+        logger.warning("Не удалось отправить статус-сообщение", exc_info=True)
+
+    async def fail(text: str) -> None:
+        """Показать сообщение об ошибке (через статус или новым сообщением)."""
+        if status is not None:
+            await _safe(status.edit_text(text))
+        else:
+            await deliver(update.message, text)
 
     try:
         tg_file = await tg_object.get_file()
         audio_bytes = bytes(await tg_file.download_as_bytearray())
     except Exception:
         logger.exception("Не удалось скачать аудио из Telegram")
-        await status.edit_text("Не удалось скачать файл. Попробуйте ещё раз.")
+        await fail("Не удалось скачать файл. Попробуйте ещё раз.")
         return
 
     if len(audio_bytes) > MAX_FILE_SIZE:
-        await status.edit_text(
+        await fail(
             f"Файл слишком большой ({human_size(len(audio_bytes))}). "
             f"Максимум — {MAX_FILE_SIZE_MB} МБ."
         )
@@ -848,7 +884,7 @@ async def _transcribe_and_reply(
         recognized = await asyncio.to_thread(transcribe_voice, audio_bytes)
     except Exception:
         logger.exception("Ошибка расшифровки аудио")
-        await status.edit_text(
+        await fail(
             "Не удалось расшифровать запись. "
             "Попробуйте другой файл или напишите текстом."
         )
@@ -857,7 +893,7 @@ async def _transcribe_and_reply(
     logger.info("Расшифровка готова: %r", (recognized or "")[:200])
     recognized = (recognized or "").strip()
     if not recognized:
-        await status.edit_text(
+        await fail(
             "В этой записи не удалось разобрать речь. "
             "Попробуйте другую запись или напишите текстом."
         )
@@ -869,7 +905,8 @@ async def _transcribe_and_reply(
     if LOG_DIALOG:
         logger.info("[%s] аудио, сырая расшифровка: %s", user_id, recognized)
 
-    await status.edit_text("✍️ Причёсываю текст…")
+    if status is not None:
+        await _safe(status.edit_text("✍️ Причёсываю текст…"))
     try:
         result = await process_transcript(recognized[:MAX_TRANSCRIPT_CHARS])
     except Exception:
@@ -879,12 +916,10 @@ async def _transcribe_and_reply(
             f"расшифровка:\n\n{recognized}"
         )
 
-    try:
-        await status.delete()
-    except Exception:
-        pass
+    if status is not None:
+        await _safe(status.delete())
 
-    await send_chunks(update.message, result)
+    await deliver(update.message, result)
     if LOG_DIALOG:
         logger.info("[%s] аудио, результат: %s", user_id, result)
 
@@ -940,7 +975,18 @@ def main() -> None:
         stats["n"], stats["u"], DB_PATH,
     )
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Таймауты побольше — сеть на этой машине бывает нестабильной.
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(10)
+        .get_updates_connect_timeout(20)
+        .get_updates_read_timeout(40)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
