@@ -1,0 +1,40 @@
+# systemd-юнит для Telegram-бота (Claude).
+#
+# Куда положить на сервере:  /etc/systemd/system/tgbot.service
+# Пути ниже рассчитаны на пользователя tgbot и каталог /opt/tgbot —
+# если у вас другие пути/пользователь, поправьте User/Group/WorkingDirectory/
+# ExecStart перед копированием на сервер (см. DEPLOY.md).
+
+[Unit]
+Description=Telegram-бот на Claude (tgbot)
+After=network-online.target
+Wants=network-online.target
+# Не даём systemd пытаться перезапускать бесконечно и быстро, если бот
+# падает сразу после старта (например, из-за неверного .env) — после
+# 5 падений за 5 минут systemd остановится и не будет крутить это по кругу.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tgbot
+Group=tgbot
+WorkingDirectory=/opt/tgbot
+# HOME нужен явно — иначе faster-whisper/huggingface_hub не найдёт свой
+# кэш моделей между перезапусками и будет каждый раз скачивать модель заново.
+Environment=HOME=/opt/tgbot
+# Гарантированный UTF-8 для вывода в лог, независимо от локали окружения —
+# без этого кириллица в логах может испортиться.
+Environment=PYTHONUTF8=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/tgbot/venv/bin/python /opt/tgbot/bot.py
+# Перезапуск при падении — вторая линия защиты поверх собственного
+# внутреннего перезапуска бота (см. RESTART_DELAY_SECONDS в bot.py):
+# та защищает от сетевых сбоев во время работы, эта — от совсем неожиданных
+# падений процесса (например, из-за нехватки памяти).
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
