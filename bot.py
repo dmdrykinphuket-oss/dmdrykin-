@@ -45,6 +45,8 @@ from datetime import datetime
 from anthropic import AsyncAnthropic
 import anthropic
 import docx
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
@@ -112,8 +114,9 @@ WEB_SEARCH_TOOL = {
 # (stop_reason == "pause_turn").
 MAX_PAUSE_RESTARTS = 3
 
-# Telegram не принимает сообщения длиннее 4096 символов.
-TELEGRAM_MAX_LEN = 4000
+# Сколько раз можно продолжить генерацию, если модель упёрлась в max_tokens
+# посреди ответа — куски потом склеиваются в один ответ (см. _run_conversation).
+MAX_CONTINUATIONS = 5
 
 # --- Документы ----------------------------------------------------------
 # Какие форматы принимаем.
@@ -144,6 +147,14 @@ FILE_THRESHOLD = 3000
 # Ограничения Telegram: подпись к файлу и размер самого файла.
 TELEGRAM_CAPTION_MAX_LEN = 1024
 TELEGRAM_DOC_MAX_SIZE = 50 * 1024 * 1024
+
+# --- Оформление .docx ------------------------------------------------------
+# Точного расчёта вёрстки без Word нет — грубая оценка по объёму текста
+# (символов на страницу A4 обычным шрифтом), с поправкой на заголовки и
+# таблицы, которые занимают больше места, чем формула предполагает.
+CHARS_PER_PAGE_ESTIMATE = 2500
+# Оглавление добавляем, только если оценка числа страниц больше этого.
+TOC_MIN_PAGES = 5
 
 # --- Голосовые сообщения ----------------------------------------------
 # Расшифровка идёт локально через faster-whisper (модель small, русский язык).
@@ -744,11 +755,131 @@ def _add_table(document, rows: list[list[str]]) -> None:
             table.cell(r, c).text = _INLINE_BOLD.sub(r"\1", cell_text)
 
 
-def build_docx(text: str) -> io.BytesIO:
+def _docx_char_count(document) -> int:
+    """Сколько символов текста реально попало в документ — считаем по самому
+    объекту Document, а не по исходной строке, чтобы поймать баг сборки
+    (например, если часть текста молча потерялась)."""
+    total = sum(len(p.text) for p in document.paragraphs)
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                total += len(cell.text)
+    return total
+
+
+def estimate_page_count(document) -> int:
+    """Грубая оценка числа страниц A4 — точного расчёта вёрстки без Word нет.
+    Ориентир — объём текста, плюс поправка на заголовки и таблицы (они
+    занимают заметно больше места на странице, чем такой же объём текста
+    в обычном абзаце)."""
+    chars = _docx_char_count(document)
+    heading_count = sum(
+        1 for p in document.paragraphs
+        if p.style is not None and p.style.name.startswith("Heading")
+    )
+    table_count = len(document.tables)
+    pages = chars / CHARS_PER_PAGE_ESTIMATE + heading_count * 0.15 + table_count * 0.3
+    return max(1, round(pages))
+
+
+def _add_field(paragraph, instruction: str, placeholder: str = "") -> None:
+    """Вставляет в абзац настоящее поле Word (PAGE, TOC…), а не статичный
+    текст — так Word сам пересчитывает значение (номер страницы, оглавление)."""
+    run = paragraph.add_run()
+    r = run._element
+
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    r.append(begin)
+
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = instruction
+    r.append(instr)
+
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    r.append(separate)
+
+    if placeholder:
+        t = OxmlElement("w:t")
+        t.set(qn("xml:space"), "preserve")
+        t.text = placeholder
+        r.append(t)
+
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    r.append(end)
+
+
+def add_page_number_footer(document) -> None:
+    """Номер текущей страницы в нижнем колонтитуле, по правому краю."""
+    footer = document.sections[0].footer
+    footer.is_linked_to_previous = False
+    paragraph = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    for run in list(paragraph.runs):
+        run._element.getparent().remove(run._element)
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    _add_field(paragraph, "PAGE", placeholder="1")
+
+
+def _insert_paragraph_after(paragraph, style=None):
+    """python-docx умеет добавлять абзацы только в конец документа — эта
+    функция вставляет новый пустой абзац сразу ПОСЛЕ заданного."""
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    new_paragraph = DocxParagraph(new_p, paragraph._parent)
+    if style is not None:
+        new_paragraph.style = style
+    return new_paragraph
+
+
+def add_table_of_contents(document) -> None:
+    """Вставляет оглавление сразу после первого заголовка документа — как
+    поле TOC по Heading 1/2, которое Word умеет пересчитывать (не статичный
+    список)."""
+    headings = [
+        p for p in document.paragraphs
+        if p.style is not None and p.style.name.startswith("Heading")
+    ]
+    anchor = headings[0] if headings else (document.paragraphs[0] if document.paragraphs else None)
+    if anchor is None:
+        return
+
+    toc_title = _insert_paragraph_after(anchor)
+    toc_title.add_run("Оглавление").bold = True
+
+    toc_field = _insert_paragraph_after(toc_title)
+    _add_field(
+        toc_field, 'TOC \\o "1-2" \\h \\z \\u',
+        placeholder=(
+            "Оглавление соберётся автоматически при открытии файла. Если этого "
+            "не произошло — выделите этот текст и нажмите F9."
+        ),
+    )
+
+
+def enable_update_fields_on_open(document) -> None:
+    """Просит Word пересчитать все поля (в т.ч. TOC) при открытии файла —
+    без этого оглавление может остаться пустым, пока не нажать F9 вручную."""
+    settings = document.settings.element
+    update_fields = OxmlElement("w:updateFields")
+    update_fields.set(qn("w:val"), "true")
+    settings.append(update_fields)
+
+
+def build_docx(text: str) -> tuple[io.BytesIO, int, int]:
     """Собирает .docx из текста ответа: заголовки, маркированные и нумерованные
     списки, таблицы и обычные абзацы (с инлайн **жирным**) — в реальном
-    форматировании Word, а не символами разметки. Общий код для /tr и обычных
-    ответов чата. Возвращает файл в памяти — без временных файлов на диске."""
+    форматировании Word, а не символами разметки. Плюс оформление: номер
+    страницы в колонтитуле (всегда) и оглавление по Heading 1/2 (если оценка
+    объёма — больше TOC_MIN_PAGES страниц), с настройкой на пересчёт полей
+    при открытии файла. Общий код для /tr и обычных ответов чата.
+
+    Возвращает (файл_в_памяти, число_символов_в_документе, оценка_страниц).
+    Число символов — по содержимому ДО оформления, чтобы показать в чате,
+    что при сборке текста ничего не потерялось (сравнить с длиной исходной
+    строки), а не смешивать его со служебными добавками вроде «Оглавление»."""
     document = docx.Document()
     for block in text.split("\n\n"):
         lines = [ln.strip() for ln in block.split("\n")]
@@ -785,10 +916,20 @@ def build_docx(text: str) -> io.BytesIO:
                 _add_paragraph_with_inline_bold(document, line, style="List Paragraph")
                 continue
             _add_paragraph_with_inline_bold(document, line)
+
+    doc_chars = _docx_char_count(document)
+
+    add_page_number_footer(document)
+
+    estimated_pages = estimate_page_count(document)
+    if estimated_pages > TOC_MIN_PAGES:
+        add_table_of_contents(document)
+        enable_update_fields_on_open(document)
+
     buffer = io.BytesIO()
     document.save(buffer)
     buffer.seek(0)
-    return buffer
+    return buffer, doc_chars, estimated_pages
 
 
 def answer_filename(base_name: str | None) -> str:
@@ -810,6 +951,26 @@ def answer_preview(text: str, max_chars: int = 600) -> str:
     return preview
 
 
+def _fit_caption(parts: list[str], limit: int) -> tuple[str, str]:
+    """Склеивает непустые части через пустую строку; если не влезает в
+    limit — режет с конца, возвращая (caption, overflow) — overflow нужно
+    отправить отдельным сообщением."""
+    parts = [p for p in parts if p]
+    if not parts:
+        return "", ""
+    caption = "\n\n".join(parts)
+    if len(caption) <= limit:
+        return caption, ""
+    kept = 0
+    for i in range(len(parts), 0, -1):
+        if len("\n\n".join(parts[:i])) <= limit:
+            kept = i
+            break
+    caption = "\n\n".join(parts[:kept]) if kept else parts[0][:limit]
+    overflow = "\n\n".join(parts[kept:])
+    return caption, overflow
+
+
 async def send_as_text_or_docx(
     message,
     text: str,
@@ -823,7 +984,8 @@ async def send_as_text_or_docx(
     длиннее FILE_THRESHOLD, либо force_file=True (команда /file).
     force_text=True — пользователь выключил автовыгрузку (/nofile): всегда текстом.
     header — краткая подпись к файлу, tail — доп. текст (например, заметки по
-    терминам), уходит в ту же подпись, а если не влезает — отдельным сообщением.
+    терминам). В подпись всегда добавляется реальный объём (символов в ответе
+    и символов, попавших в документ) — чтобы было видно, что ничего не потерялось.
     """
     combined_text = f"{text}\n\n{tail}" if tail else text
 
@@ -831,7 +993,7 @@ async def send_as_text_or_docx(
         await deliver(message, combined_text)
         return
 
-    buffer = build_docx(text)
+    buffer, doc_chars, estimated_pages = build_docx(text)
     size = buffer.getbuffer().nbytes
 
     if size > TELEGRAM_DOC_MAX_SIZE:
@@ -842,11 +1004,14 @@ async def send_as_text_or_docx(
         )
         return
 
-    caption = f"{header}\n\n{tail}" if tail else header
-    extra = ""
-    if len(caption) > TELEGRAM_CAPTION_MAX_LEN:
-        caption = header
-        extra = tail
+    size_note = (
+        f"📊 Объём ответа: {len(text)} симв. В документ вошло: {doc_chars} симв. "
+        f"(~{estimated_pages} стр.)"
+    )
+    if doc_chars < len(text) * 0.5:
+        size_note += " ⚠️ Похоже, часть текста не попала в файл — проверьте вручную."
+
+    caption, extra = _fit_caption([header, size_note, tail], TELEGRAM_CAPTION_MAX_LEN)
 
     try:
         await message.reply_document(document=buffer, filename=filename, caption=caption)
@@ -882,7 +1047,7 @@ async def deliver_translation(
         filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{target_lang}.docx"
 
     lang_name = LANG_NAMES.get(target_lang, target_lang)
-    header = f"📄 Перевод готов — {lang_name}, {len(translated)} симв."
+    header = f"📄 Перевод готов — {lang_name}."
 
     last_answers[user_id] = {"text": translated, "base_name": base_name}
     await send_as_text_or_docx(
@@ -1105,58 +1270,106 @@ async def _stream_create(messages: list[dict], use_web_search: bool, on_progress
         return await stream.get_final_message()
 
 
+def _responses_text(responses: list) -> str:
+    """Текст всех Message подряд (без citations) — для прогресса при
+    max_tokens-продолжении и как основа _extract_answer. Блоки — это смежные
+    куски одного текста (в т.ч. между продолжениями после max_tokens), поэтому
+    склеиваем без разделителя — иначе на стыке может разорваться слово."""
+    parts = []
+    for r in responses:
+        for block in r.content:
+            if block.type == "text" and block.text:
+                parts.append(block.text)
+    return "".join(parts)
+
+
 async def _run_conversation(
     history: list[dict], use_web_search: bool, document: dict | None, on_progress=None
-):
-    """Запрос к модели (потоково). Если ответ «встал на паузу» посреди
-    поиска — продолжаем его."""
+) -> list:
+    """Запрос к модели (потоково). Возвращает список Message по цепочке:
+    - если ответ «встал на паузу» посреди поиска (pause_turn) — продолжаем;
+    - если упёрлись в max_tokens посреди ответа — тоже продолжаем (явной
+      просьбой «продолжи»), до MAX_CONTINUATIONS раз; куски склеивает
+      _extract_answer, так что ответ доходит до конца, а не обрывается."""
     messages = _build_messages(history, document)
-    response = await _stream_create(messages, use_web_search, on_progress)
-    restarts = 0
-    while response.stop_reason == "pause_turn" and restarts < MAX_PAUSE_RESTARTS:
-        messages = messages + [{"role": "assistant", "content": response.content}]
-        response = await _stream_create(messages, use_web_search, on_progress)
-        restarts += 1
-    return response
+    responses: list = []
+
+    async def progress_wrapper(chunk_text: str) -> None:
+        if on_progress:
+            await on_progress(_responses_text(responses) + chunk_text)
+
+    response = await _stream_create(messages, use_web_search, progress_wrapper)
+    responses.append(response)
+
+    pause_restarts = 0
+    continuations = 0
+    while True:
+        if response.stop_reason == "pause_turn" and pause_restarts < MAX_PAUSE_RESTARTS:
+            messages = messages + [{"role": "assistant", "content": response.content}]
+            response = await _stream_create(messages, use_web_search, progress_wrapper)
+            responses.append(response)
+            pause_restarts += 1
+            continue
+        if response.stop_reason == "max_tokens" and continuations < MAX_CONTINUATIONS:
+            messages = messages + [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": (
+                    "Продолжи ответ ровно с того места, где остановился — "
+                    "без вступлений, извинений и повторов уже написанного."
+                )},
+            ]
+            response = await _stream_create(messages, use_web_search, progress_wrapper)
+            responses.append(response)
+            continuations += 1
+            continue
+        break
+    return responses
 
 
-def _extract_answer(response) -> str:
-    """Собирает текст ответа и список источников (ссылок), на которые сослалась модель."""
+def _extract_answer(responses: list) -> str:
+    """Собирает текст ответа (возможно, из нескольких Message — если пришлось
+    продолжать после max_tokens) и список источников (ссылок), на которые
+    сослалась модель."""
     text_parts: list[str] = []
     sources: list[tuple[str, str]] = []
     seen: set[str] = set()
 
-    for block in response.content:
-        if block.type != "text":
-            continue
-        if block.text:
-            text_parts.append(block.text)
-        # У текстовых блоков после веб-поиска есть citations со ссылками на источники.
-        for citation in getattr(block, "citations", None) or []:
-            url = getattr(citation, "url", None)
-            if url and url not in seen:
-                seen.add(url)
-                sources.append((getattr(citation, "title", None) or url, url))
+    for response in responses:
+        for block in response.content:
+            if block.type != "text":
+                continue
+            if block.text:
+                text_parts.append(block.text)
+            # У текстовых блоков после веб-поиска есть citations со ссылками на источники.
+            for citation in getattr(block, "citations", None) or []:
+                url = getattr(citation, "url", None)
+                if url and url not in seen:
+                    seen.add(url)
+                    sources.append((getattr(citation, "title", None) or url, url))
+
+    last = responses[-1]
 
     if not text_parts:
         # Модель ничего не написала (например, весь max_tokens ушёл на
         # размышление и/или вызовы инструментов) — показываем диагностику
         # вместо молчаливой заглушки, чтобы было понятно, что случилось.
-        usage = getattr(response, "usage", None)
+        usage = getattr(last, "usage", None)
         output_tokens = getattr(usage, "output_tokens", None)
         answer = (
             f"⚠️ Модель не вернула видимый текст "
-            f"(stop_reason: {response.stop_reason}, "
+            f"(stop_reason: {last.stop_reason}, "
             f"токенов вывода использовано: {output_tokens if output_tokens is not None else '?'})."
         )
-        if response.stop_reason == "max_tokens":
+        if last.stop_reason == "max_tokens":
             answer += (
                 " Похоже, ответ не уместился в лимит — сформулируйте запрос "
                 "короче или попросите ответ по частям."
             )
         return answer
 
-    answer = "\n".join(text_parts).strip()
+    # Без разделителя: блоки — смежные куски одного текста (в т.ч. между
+    # продолжениями после max_tokens), "\n" между ними мог бы разорвать слово.
+    answer = "".join(text_parts).strip()
 
     if sources:
         links = "\n".join(
@@ -1164,8 +1377,13 @@ def _extract_answer(response) -> str:
         )
         answer = f"{answer}\n\nИсточники:\n{links}"
 
-    if len(answer) > TELEGRAM_MAX_LEN:
-        answer = answer[:TELEGRAM_MAX_LEN] + "…"
+    if last.stop_reason == "max_tokens":
+        # Продолжали MAX_CONTINUATIONS раз и всё равно не уложились.
+        answer += (
+            "\n\n⚠️ Ответ мог оборваться — не уложился даже после нескольких "
+            "продолжений. Попросите закончить мысль или сузьте вопрос."
+        )
+
     return answer
 
 
@@ -1175,21 +1393,22 @@ async def ask_claude(history: list[dict], document: dict | None = None, on_progr
 
     Сначала пробуем с веб-поиском. Если поиск недоступен (например, не включён
     для аккаунта Anthropic) — повторяем запрос без него, чтобы бот всё равно ответил.
-    Возвращает (текст_ответа, response) — response нужен вызывающему для лога.
+    Возвращает (текст_ответа, responses) — responses (список Message, может
+    быть длиннее одного элемента из-за продолжений) нужен вызывающему для лога.
     Бросает asyncio.TimeoutError, если генерация не уложилась в лимит времени.
     """
     try:
-        response = await asyncio.wait_for(
+        responses = await asyncio.wait_for(
             _run_conversation(history, use_web_search=True, document=document, on_progress=on_progress),
             timeout=GENERATION_TIMEOUT_SECONDS,
         )
     except anthropic.BadRequestError:
         logger.warning("Веб-поиск недоступен — отвечаю без него", exc_info=True)
-        response = await asyncio.wait_for(
+        responses = await asyncio.wait_for(
             _run_conversation(history, use_web_search=False, document=document, on_progress=on_progress),
             timeout=GENERATION_TIMEOUT_SECONDS,
         )
-    return _extract_answer(response), response
+    return _extract_answer(responses), responses
 
 
 # --- Обработчики команд и сообщений --------------------------------------
@@ -1519,7 +1738,7 @@ async def get_model_answer(
         await _safe(status.edit_text(f"✍️ Генерирую ответ… ({len(text_so_far)} симв.)\n\n…{preview}"))
 
     try:
-        answer, response = await ask_claude(history, document, on_progress=progress)
+        answer, responses = await ask_claude(history, document, on_progress=progress)
     except (asyncio.TimeoutError, TimeoutError):
         logger.warning("Генерация превысила таймаут (%s с)", GENERATION_TIMEOUT_SECONDS)
         if status is not None:
@@ -1570,8 +1789,8 @@ async def get_model_answer(
     log_request(
         "chat", user_id, MODEL, context_size,
         "empty" if answer.startswith("⚠️ Модель не вернула видимый текст") else "ok",
-        stop_reason=response.stop_reason,
-        output_tokens=getattr(response.usage, "output_tokens", None),
+        stop_reason=responses[-1].stop_reason,
+        output_tokens=sum(getattr(r.usage, "output_tokens", 0) or 0 for r in responses),
     )
 
     if LOG_DIALOG:
