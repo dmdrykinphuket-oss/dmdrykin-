@@ -39,6 +39,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime
 
 from anthropic import AsyncAnthropic
@@ -79,8 +80,21 @@ MAX_HISTORY_MESSAGES = 20
 # из какой папки запущен бот.
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.db")
 
-# Максимальная длина ответа модели (в токенах).
-MAX_TOKENS = 2000
+# Лог каждого обращения к модели (контекст, модель, результат) — отдельный
+# файл, в явной кодировке UTF-8 (не зависит от кодировки консоли).
+REQUEST_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.log")
+
+# Максимальная длина ответа модели (в токенах). claude-sonnet-5 по умолчанию
+# думает адаптивно (thinking), и это «съедает» часть этого лимита ещё до
+# видимого текста — при низком MAX_TOKENS на тяжёлых запросах ответ может
+# оказаться пустым (весь лимит ушёл на размышление). 16000 — безопасный
+# потолок для обычного (не потокового) запроса.
+MAX_TOKENS = 16000
+
+# Контекстное окно claude-sonnet-5 (токены) и порог, при котором предупреждаем
+# пользователя, что запрос близок к лимиту.
+MODEL_CONTEXT_WINDOW = 1_000_000
+CONTEXT_WARN_RATIO = 0.8
 
 # --- Веб-поиск -----------------------------------------------------------
 # Модель сама решает, искать ли в интернете или ответить по памяти.
@@ -119,7 +133,7 @@ MAX_DOC_CHARS = 120_000
 # переводим по очереди, но в одной «сессии» — прошлые фрагменты и их перевод
 # остаются в контексте, чтобы терминология не расходилась между частями.
 TRANSLATE_CHUNK_CHARS = 6000
-TRANSLATE_MAX_TOKENS = 4096
+TRANSLATE_MAX_TOKENS = 8192
 
 # Перевод длиннее этого — отдаём файлом .docx, короче — обычным текстом.
 TRANSLATE_FILE_THRESHOLD = 3000
@@ -184,9 +198,77 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpx2").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# Отдельный лог-файл: одна строка на каждое обращение к модели (объём
+# контекста, модель, что вышло). Не смешивается с общим логом на консоли —
+# явная кодировка UTF-8, свой файл.
+request_logger = logging.getLogger("requests")
+request_logger.setLevel(logging.INFO)
+request_logger.propagate = False
+_request_file_handler = logging.FileHandler(REQUEST_LOG_PATH, encoding="utf-8")
+_request_file_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+request_logger.addHandler(_request_file_handler)
+
 # --- Клиент Anthropic ---------------------------------------------------
 
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def log_request(
+    kind: str,
+    user_id: int,
+    model: str,
+    context_size,
+    result: str,
+    stop_reason: str | None = None,
+    output_tokens: int | None = None,
+) -> None:
+    """Пишет одну строку в requests.log на каждое обращение к модели.
+
+    context_size — либо точное число входных токенов (из count_context_tokens),
+    либо строка вида '~12000 симв.' (грубая оценка, без лишнего вызова API).
+    """
+    request_logger.info(
+        "user=%s kind=%s model=%s context=%s output_tokens=%s stop_reason=%s result=%s",
+        user_id, kind, model, context_size,
+        output_tokens if output_tokens is not None else "?",
+        stop_reason or "?",
+        result,
+    )
+
+
+async def count_context_tokens(
+    model: str, system, messages: list[dict], tools: list[dict] | None = None
+) -> int | None:
+    """Точный подсчёт входных токенов запроса через API Anthropic.
+
+    None при любой ошибке (сеть, недоступность метода и т.п.) — подсчёт
+    контекста необязателен и не должен блокировать основной запрос.
+    """
+    try:
+        kwargs = {"model": model, "system": system, "messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+        result = await claude.messages.count_tokens(**kwargs)
+        return result.input_tokens
+    except Exception:
+        logger.debug("Не удалось посчитать токены контекста", exc_info=True)
+        return None
+
+
+async def warn_if_context_large(update: Update, context_tokens: int | None) -> None:
+    """Если контекст запроса близок к лимиту модели — предупреждает в чат."""
+    if context_tokens is None:
+        return
+    ratio = context_tokens / MODEL_CONTEXT_WINDOW
+    if ratio < CONTEXT_WARN_RATIO:
+        return
+    text = (
+        f"⚠️ Контекст запроса большой: {context_tokens:,} из {MODEL_CONTEXT_WINDOW:,} "
+        f"токенов ({ratio:.0%}) — близко к лимиту модели. Ответ может быть "
+        "обрезан или запрос отклонён. Попробуйте /reset (сократить историю) "
+        "или /forget (убрать документ из контекста)."
+    ).replace(",", " ")
+    await _safe(update.message.reply_text(text))
 
 # Активный документ каждого пользователя (в памяти, при перезапуске сбрасывается):
 # {telegram_id: {"filename": str, "text": str, "size": int (байт)}}
@@ -430,7 +512,7 @@ _CLEAN_SCHEMA = {
 }
 
 
-async def process_transcript(raw: str) -> str:
+async def process_transcript(raw: str, user_id: int) -> str:
     """Причёсывает расшифровку через модель и возвращает готовый текст для чата.
 
     Если raw длиннее TRANSCRIPT_SUMMARY_THRESHOLD — добавляет структурное резюме.
@@ -461,8 +543,14 @@ async def process_transcript(raw: str) -> str:
         }],
         output_config={"format": {"type": "json_schema", "schema": _CLEAN_SCHEMA}},
     )
-    text = next(b.text for b in response.content if b.type == "text")
-    data = json.loads(text)
+    text = next((b.text for b in response.content if b.type == "text"), "")
+    log_request(
+        "transcript", user_id, MODEL, f"~{len(raw)} симв.",
+        "ok" if text else "empty",
+        stop_reason=response.stop_reason,
+        output_tokens=getattr(response.usage, "output_tokens", None),
+    )
+    data = json.loads(text) if text else {}
 
     cleaned = (data.get("cleaned") or "").strip()
     if not cleaned:
@@ -706,7 +794,9 @@ def split_for_translation(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
-async def translate_text(text: str, on_progress=None) -> tuple[str, list[dict]]:
+async def translate_text(
+    text: str, user_id: int, on_progress=None
+) -> tuple[str, list[dict]]:
     """Переводит текст через claude-sonnet-5. Длинный текст режет на части и
     переводит их по очереди в одной сессии — каждая следующая часть видит в
     контексте предыдущие фрагменты и их перевод, чтобы термины не расходились.
@@ -728,8 +818,14 @@ async def translate_text(text: str, on_progress=None) -> tuple[str, list[dict]]:
             messages=messages,
             output_config={"format": {"type": "json_schema", "schema": TRANSLATE_SCHEMA}},
         )
-        raw = next(b.text for b in response.content if b.type == "text")
-        data = json.loads(raw)
+        raw = next((b.text for b in response.content if b.type == "text"), "")
+        log_request(
+            "translate", user_id, MODEL, f"~{len(chunk)} симв. (часть {i}/{len(chunks)})",
+            "ok" if raw else "empty",
+            stop_reason=response.stop_reason,
+            output_tokens=getattr(response.usage, "output_tokens", None),
+        )
+        data = json.loads(raw) if raw else {}
         translated = (data.get("translated") or "").strip()
         # В историю кладём чистый перевод (не JSON) — так следующий фрагмент
         # видит обычный текст, а не служебную обёртку.
@@ -740,30 +836,35 @@ async def translate_text(text: str, on_progress=None) -> tuple[str, list[dict]]:
 
 
 async def run_translation(
-    update: Update, text: str, on_progress=None
+    update: Update, text: str, user_id: int, on_progress=None
 ) -> tuple[str, list[dict]] | None:
     """Переводит текст и ловит ошибки API так же, как обычные ответы модели.
     При ошибке сам пишет пояснение в чат и возвращает None."""
     try:
-        return await translate_text(text, on_progress=on_progress)
+        return await translate_text(text, user_id, on_progress=on_progress)
     except anthropic.APIStatusError as e:
         logger.exception("Ошибка Anthropic API при переводе")
         await update.message.reply_text(
-            f"Ошибка при обращении к Claude (код {e.status_code}). "
+            f"Ошибка при обращении к Claude (код {e.status_code}): {e.message}\n"
             "Попробуйте ещё раз чуть позже."
         )
+        log_request("translate", user_id, MODEL, f"~{len(text)} симв.", f"error:{type(e).__name__}({e.status_code})")
         return None
-    except anthropic.APIConnectionError:
+    except anthropic.APIConnectionError as e:
         logger.exception("Проблема сети при переводе")
         await update.message.reply_text(
-            "Не удалось связаться с Claude (проблема сети). Попробуйте ещё раз."
+            f"Не удалось связаться с Claude (проблема сети): {e}\n"
+            "Попробуйте ещё раз."
         )
+        log_request("translate", user_id, MODEL, f"~{len(text)} симв.", f"error:{type(e).__name__}")
         return None
-    except Exception:
+    except Exception as e:
         logger.exception("Непредвиденная ошибка при переводе")
         await update.message.reply_text(
-            "Что-то пошло не так при переводе. Попробуйте ещё раз позже."
+            f"Что-то пошло не так при переводе: {e}\n"
+            "Попробуйте ещё раз позже."
         )
+        log_request("translate", user_id, MODEL, f"~{len(text)} симв.", f"error:{type(e).__name__}")
         return None
 
 
@@ -848,7 +949,20 @@ def _build_messages(history: list[dict], document: dict | None) -> list[dict]:
     return preamble + list(history)
 
 
-async def _create_message(messages: list[dict], use_web_search: bool):
+# Дольше этого генерацию не ждём — прерываем и сообщаем пользователю
+# (не молчим и не виснем на неограниченное время).
+GENERATION_TIMEOUT_SECONDS = 600
+
+# Не чаще, чем раз в столько секунд, обновляем статус-сообщение в чате —
+# иначе упрёмся в лимит правок Telegram на демонстративно длинной генерации.
+STATUS_UPDATE_INTERVAL = 3.0
+
+
+async def _stream_create(messages: list[dict], use_web_search: bool, on_progress=None):
+    """Запрос к модели в потоковом режиме (streaming) — ответ собирается по
+    кусочкам, а не ожидается одним блоком целиком. По ходу (не чаще, чем раз в
+    STATUS_UPDATE_INTERVAL) зовёт on_progress(накопленный_текст). Возвращает
+    финальный Message — как обычный (не потоковый) create()."""
     kwargs = dict(
         model=MODEL,
         max_tokens=MAX_TOKENS,
@@ -857,17 +971,31 @@ async def _create_message(messages: list[dict], use_web_search: bool):
     )
     if use_web_search:
         kwargs["tools"] = [WEB_SEARCH_TOOL]
-    return await claude.messages.create(**kwargs)
+
+    text_parts: list[str] = []
+    last_update = 0.0
+    async with claude.messages.stream(**kwargs) as stream:
+        async for event in stream:
+            if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                text_parts.append(event.delta.text)
+                now = time.monotonic()
+                if on_progress and now - last_update >= STATUS_UPDATE_INTERVAL:
+                    last_update = now
+                    await on_progress("".join(text_parts))
+        return await stream.get_final_message()
 
 
-async def _run_conversation(history: list[dict], use_web_search: bool, document: dict | None):
-    """Запрос к модели. Если ответ «встал на паузу» посреди поиска — продолжаем его."""
+async def _run_conversation(
+    history: list[dict], use_web_search: bool, document: dict | None, on_progress=None
+):
+    """Запрос к модели (потоково). Если ответ «встал на паузу» посреди
+    поиска — продолжаем его."""
     messages = _build_messages(history, document)
-    response = await _create_message(messages, use_web_search)
+    response = await _stream_create(messages, use_web_search, on_progress)
     restarts = 0
     while response.stop_reason == "pause_turn" and restarts < MAX_PAUSE_RESTARTS:
         messages = messages + [{"role": "assistant", "content": response.content}]
-        response = await _create_message(messages, use_web_search)
+        response = await _stream_create(messages, use_web_search, on_progress)
         restarts += 1
     return response
 
@@ -890,7 +1018,25 @@ def _extract_answer(response) -> str:
                 seen.add(url)
                 sources.append((getattr(citation, "title", None) or url, url))
 
-    answer = "\n".join(text_parts).strip() or "(пустой ответ от модели)"
+    if not text_parts:
+        # Модель ничего не написала (например, весь max_tokens ушёл на
+        # размышление и/или вызовы инструментов) — показываем диагностику
+        # вместо молчаливой заглушки, чтобы было понятно, что случилось.
+        usage = getattr(response, "usage", None)
+        output_tokens = getattr(usage, "output_tokens", None)
+        answer = (
+            f"⚠️ Модель не вернула видимый текст "
+            f"(stop_reason: {response.stop_reason}, "
+            f"токенов вывода использовано: {output_tokens if output_tokens is not None else '?'})."
+        )
+        if response.stop_reason == "max_tokens":
+            answer += (
+                " Похоже, ответ не уместился в лимит — сформулируйте запрос "
+                "короче или попросите ответ по частям."
+            )
+        return answer
+
+    answer = "\n".join(text_parts).strip()
 
     if sources:
         links = "\n".join(
@@ -903,18 +1049,27 @@ def _extract_answer(response) -> str:
     return answer
 
 
-async def ask_claude(history: list[dict], document: dict | None = None) -> str:
-    """Отправляет историю (и документ, если есть) в Claude и возвращает текст ответа.
+async def ask_claude(history: list[dict], document: dict | None = None, on_progress=None):
+    """Отправляет историю (и документ, если есть) в Claude — потоково, с
+    ограничением по времени (GENERATION_TIMEOUT_SECONDS).
 
     Сначала пробуем с веб-поиском. Если поиск недоступен (например, не включён
     для аккаунта Anthropic) — повторяем запрос без него, чтобы бот всё равно ответил.
+    Возвращает (текст_ответа, response) — response нужен вызывающему для лога.
+    Бросает asyncio.TimeoutError, если генерация не уложилась в лимит времени.
     """
     try:
-        response = await _run_conversation(history, use_web_search=True, document=document)
+        response = await asyncio.wait_for(
+            _run_conversation(history, use_web_search=True, document=document, on_progress=on_progress),
+            timeout=GENERATION_TIMEOUT_SECONDS,
+        )
     except anthropic.BadRequestError:
         logger.warning("Веб-поиск недоступен — отвечаю без него", exc_info=True)
-        response = await _run_conversation(history, use_web_search=False, document=document)
-    return _extract_answer(response)
+        response = await asyncio.wait_for(
+            _run_conversation(history, use_web_search=False, document=document, on_progress=on_progress),
+            timeout=GENERATION_TIMEOUT_SECONDS,
+        )
+    return _extract_answer(response), response
 
 
 # --- Обработчики команд и сообщений --------------------------------------
@@ -1042,7 +1197,7 @@ async def handle_translate_document(
         if status is not None and total > 1:
             await _safe(status.edit_text(f"🌐 Перевожу «{filename}»… часть {i}/{total}"))
 
-    result = await run_translation(update, text, on_progress=progress)
+    result = await run_translation(update, text, user_id, on_progress=progress)
     if status is not None:
         await _safe(status.delete())
     if result is None:
@@ -1178,30 +1333,89 @@ async def get_model_answer(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
+    # Точный объём контекста этого запроса — до отправки: предупреждаем,
+    # если он близок к лимиту модели, и логируем в любом случае.
+    # (web_search — server tool, count_tokens его не принимает — считаем без tools.)
+    context_tokens = await count_context_tokens(
+        MODEL, SYSTEM_PROMPT, _build_messages(history, document)
+    )
+    await warn_if_context_large(update, context_tokens)
+    if context_tokens is not None:
+        context_size = context_tokens
+    else:
+        chars = sum(len(m["content"]) for m in history)
+        context_size = f"~{chars} симв."
+
+    # Статус-сообщение: показываем, что генерация идёт, и по ходу (не чаще,
+    # чем раз в STATUS_UPDATE_INTERVAL) обновляем его накопленным текстом —
+    # ответ собирается потоково (streaming), а не ждётся одним куском.
+    status = None
     try:
-        answer = await ask_claude(history, document)
+        status = await update.message.reply_text("✍️ Генерирую ответ…")
+    except Exception:
+        logger.warning("Не удалось отправить статус-сообщение", exc_info=True)
+
+    async def progress(text_so_far: str) -> None:
+        if status is None:
+            return
+        preview = text_so_far[-300:]
+        await _safe(status.edit_text(f"✍️ Генерирую ответ… ({len(text_so_far)} симв.)\n\n…{preview}"))
+
+    try:
+        answer, response = await ask_claude(history, document, on_progress=progress)
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning("Генерация превысила таймаут (%s с)", GENERATION_TIMEOUT_SECONDS)
+        if status is not None:
+            await _safe(status.delete())
+        await update.message.reply_text(
+            f"⌛ Генерация не уложилась в {GENERATION_TIMEOUT_SECONDS // 60} минут — прервал запрос. "
+            "Попробуйте сформулировать короче или разбить на части."
+        )
+        log_request("chat", user_id, MODEL, context_size, "timeout")
+        return None
     except anthropic.APIStatusError as e:
         logger.exception("Ошибка Anthropic API")
+        if status is not None:
+            await _safe(status.delete())
         await update.message.reply_text(
-            f"Ошибка при обращении к Claude (код {e.status_code}). "
+            f"Ошибка при обращении к Claude (код {e.status_code}): {e.message}\n"
             "Попробуйте ещё раз чуть позже."
         )
+        log_request("chat", user_id, MODEL, context_size, f"error:{type(e).__name__}({e.status_code})")
         return None
-    except anthropic.APIConnectionError:
+    except anthropic.APIConnectionError as e:
         logger.exception("Проблема сети при обращении к Anthropic")
+        if status is not None:
+            await _safe(status.delete())
         await update.message.reply_text(
-            "Не удалось связаться с Claude (проблема сети). Попробуйте ещё раз."
+            f"Не удалось связаться с Claude (проблема сети): {e}\n"
+            "Попробуйте ещё раз."
         )
+        log_request("chat", user_id, MODEL, context_size, f"error:{type(e).__name__}")
         return None
-    except Exception:
+    except Exception as e:
         logger.exception("Непредвиденная ошибка при обращении к Claude")
+        if status is not None:
+            await _safe(status.delete())
         await update.message.reply_text(
-            "Что-то пошло не так при обращении к Claude. Попробуйте ещё раз позже."
+            f"Что-то пошло не так при обращении к Claude: {e}\n"
+            "Попробуйте ещё раз позже."
         )
+        log_request("chat", user_id, MODEL, context_size, f"error:{type(e).__name__}")
         return None
+
+    if status is not None:
+        await _safe(status.delete())
 
     db_add_message(user_id, "user", user_text)
     db_add_message(user_id, "assistant", answer)
+
+    log_request(
+        "chat", user_id, MODEL, context_size,
+        "empty" if answer.startswith("⚠️ Модель не вернула видимый текст") else "ok",
+        stop_reason=response.stop_reason,
+        output_tokens=getattr(response.usage, "output_tokens", None),
+    )
 
     if LOG_DIALOG:
         logger.info("[%s] бот: %s", user_id, answer)
@@ -1227,7 +1441,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action=ChatAction.TYPING
         )
-        result = await run_translation(update, text)
+        result = await run_translation(update, text, user_id)
         if result is not None:
             translated, notes = result
             target_lang = detect_target_language(text)
@@ -1333,7 +1547,7 @@ async def _transcribe_and_reply(
     if status is not None:
         await _safe(status.edit_text("✍️ Причёсываю текст…"))
     try:
-        result = await process_transcript(recognized[:MAX_TRANSCRIPT_CHARS])
+        result = await process_transcript(recognized[:MAX_TRANSCRIPT_CHARS], user_id)
     except Exception:
         logger.exception("Не удалось обработать расшифровку моделью")
         result = (
@@ -1401,6 +1615,8 @@ def main() -> None:
     )
 
     # Таймауты побольше — сеть на этой машине бывает нестабильной.
+    # concurrent_updates — сообщения обрабатываются параллельно: один тяжёлый
+    # запрос (например, долгая генерация ответа) не блокирует остальные.
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -1410,6 +1626,7 @@ def main() -> None:
         .pool_timeout(10)
         .get_updates_connect_timeout(20)
         .get_updates_read_timeout(40)
+        .concurrent_updates(8)
         .build()
     )
 
@@ -1439,8 +1656,33 @@ def main() -> None:
     threading.Thread(target=_get_whisper_model, daemon=True).start()
 
     logger.info("Бот запущен. Разрешённые пользователи: %s", sorted(ALLOWED_USERS))
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    # bootstrap_retries=-1 — при обрыве сети на самом старте (get_me() и т.п.)
+    # PTB повторяет попытки бесконечно вместо падения с первого же сбоя.
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        bootstrap_retries=-1,
+    )
+
+
+# Пауза перед повторным запуском после неожиданного падения.
+RESTART_DELAY_SECONDS = 10
 
 
 if __name__ == "__main__":
-    main()
+    # Второй рубеж защиты (сверх bootstrap_retries): если что-то всё же
+    # уронит процесс во время работы (не только на старте) — не молчим
+    # до ручного перезапуска, а поднимаем бота заново.
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            break
+        except SystemExit:
+            # Ошибка конфигурации (нет токена и т.п.) — повторять бессмысленно.
+            raise
+        except Exception:
+            logger.exception(
+                "Бот упал, перезапуск через %s с", RESTART_DELAY_SECONDS
+            )
+            time.sleep(RESTART_DELAY_SECONDS)
