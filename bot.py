@@ -135,8 +135,11 @@ MAX_DOC_CHARS = 120_000
 TRANSLATE_CHUNK_CHARS = 6000
 TRANSLATE_MAX_TOKENS = 8192
 
-# Перевод длиннее этого — отдаём файлом .docx, короче — обычным текстом.
-TRANSLATE_FILE_THRESHOLD = 3000
+# --- Выгрузка длинных ответов файлом --------------------------------------
+# Общее правило для ЛЮБОГО ответа модели (обычный чат и /tr): длиннее этого —
+# отдаём файлом .docx, короче — обычным текстом. /file отдаёт файлом
+# принудительно, /nofile отключает это автоматическое поведение до конца сессии.
+FILE_THRESHOLD = 3000
 
 # Ограничения Telegram: подпись к файлу и размер самого файла.
 TELEGRAM_CAPTION_MAX_LEN = 1024
@@ -281,6 +284,14 @@ raw_transcripts: dict[int, str] = {}
 # Кто сейчас в режиме перевода (/tr): {telegram_id: True}.
 # В памяти, при перезапуске сбрасывается — как documents и raw_transcripts.
 translate_mode: dict[int, bool] = {}
+
+# Последний текстовый ответ каждого пользователя (чат или перевод) — чтобы
+# /file могла отдать его файлом задним числом. {user_id: {"text", "base_name"}}
+last_answers: dict[int, dict] = {}
+
+# Кто выключил автоматическую выгрузку длинных ответов файлом (/nofile) —
+# до конца сессии (в памяти, сбрасывается при перезапуске).
+nofile_users: dict[int, bool] = {}
 
 
 # --- История диалогов: SQLite -----------------------------------------
@@ -672,28 +683,89 @@ def format_notes_block(notes: list[dict]) -> str:
     return "⚠️ Неоднозначные термины:\n" + "\n".join(items)
 
 
+# --- Сборка .docx из ответа модели (общий код для /tr и обычных ответов) --
+# Понимаем: заголовки — Markdown ATX (# / ##…) и наш «весь абзац в **…**»;
+# маркированные и нумерованные списки; таблицы — свой [TABLE]…[/TABLE]
+# (табуляция между ячейками, используется в /tr) и обычный Markdown (|a|b|);
+# инлайн **жирный** внутри абзаца — реальным форматированием, а не звёздочками.
 _HEADING_LINE = re.compile(r"^\*\*(.+)\*\*$")
+_ATX_HEADING_LINE = re.compile(r"^(#{1,6})\s+(.+)$")
 _BULLET_LINE = re.compile(r"^[•\-*]\s+(.*)")
 _NUMBERED_LINE = re.compile(r"^(?:\d{1,3}|[a-zA-Zа-яА-Я]|[ivxlcdm]{1,6})[.)]\s+(.*)", re.IGNORECASE)
+_INLINE_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_TABLE_ROW_LINE = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_SEPARATOR_LINE = re.compile(r"^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?\s*$")
 
 
-def build_translated_docx(text: str) -> io.BytesIO:
-    """Собирает .docx из переведённого текста: заголовки (**…**), маркированные
-    и нумерованные списки, таблицы ([TABLE]…[/TABLE], ячейки через табуляцию)
-    и обычные абзацы. Возвращает файл в памяти — без временных файлов на диске."""
+def _add_paragraph_with_inline_bold(document, text: str, style: str | None = None):
+    """Абзац с реальным полужирным форматированием там, где в тексте было
+    **выделение** — вместо того чтобы оставить звёздочки как есть."""
+    paragraph = document.add_paragraph(style=style) if style else document.add_paragraph()
+    pos = 0
+    for m in _INLINE_BOLD.finditer(text):
+        if m.start() > pos:
+            paragraph.add_run(text[pos:m.start()])
+        paragraph.add_run(m.group(1)).bold = True
+        pos = m.end()
+    if pos < len(text):
+        paragraph.add_run(text[pos:])
+    return paragraph
+
+
+def _parse_markdown_table(lines: list[str]) -> list[list[str]] | None:
+    """Разбирает обычную Markdown-таблицу (|a|b|\n|---|---|\n|1|2|).
+    None, если это не таблица."""
+    if len(lines) < 2:
+        return None
+    if not _TABLE_ROW_LINE.match(lines[0]) or not _TABLE_SEPARATOR_LINE.match(lines[1]):
+        return None
+    rows = []
+    for line in [lines[0]] + lines[2:]:
+        if not _TABLE_ROW_LINE.match(line):
+            break
+        cell_text = line.strip()
+        if cell_text.startswith("|"):
+            cell_text = cell_text[1:]
+        if cell_text.endswith("|"):
+            cell_text = cell_text[:-1]
+        rows.append([c.strip() for c in cell_text.split("|")])
+    return rows or None
+
+
+def _add_table(document, rows: list[list[str]]) -> None:
+    if not rows:
+        return
+    cols = max(len(r) for r in rows)
+    table = document.add_table(rows=len(rows), cols=cols)
+    table.style = "Table Grid"
+    for r, row in enumerate(rows):
+        for c in range(cols):
+            cell_text = row[c] if c < len(row) else ""
+            table.cell(r, c).text = _INLINE_BOLD.sub(r"\1", cell_text)
+
+
+def build_docx(text: str) -> io.BytesIO:
+    """Собирает .docx из текста ответа: заголовки, маркированные и нумерованные
+    списки, таблицы и обычные абзацы (с инлайн **жирным**) — в реальном
+    форматировании Word, а не символами разметки. Общий код для /tr и обычных
+    ответов чата. Возвращает файл в памяти — без временных файлов на диске."""
     document = docx.Document()
     for block in text.split("\n\n"):
         lines = [ln.strip() for ln in block.split("\n")]
-        if lines and lines[0] == "[TABLE]":
-            rows = [ln.split("\t") for ln in lines[1:] if ln and ln != "[/TABLE]"]
-            if rows:
-                cols = max(len(r) for r in rows)
-                table = document.add_table(rows=len(rows), cols=cols)
-                table.style = "Table Grid"
-                for r, row in enumerate(rows):
-                    for c in range(cols):
-                        table.cell(r, c).text = row[c] if c < len(row) else ""
+        non_empty = [ln for ln in lines if ln]
+        if not non_empty:
             continue
+
+        if non_empty[0] == "[TABLE]":
+            rows = [ln.split("\t") for ln in non_empty[1:] if ln != "[/TABLE]"]
+            _add_table(document, rows)
+            continue
+
+        table_rows = _parse_markdown_table(non_empty)
+        if table_rows:
+            _add_table(document, table_rows)
+            continue
+
         for line in lines:
             if not line:
                 continue
@@ -701,37 +773,107 @@ def build_translated_docx(text: str) -> io.BytesIO:
             if heading:
                 document.add_heading(heading.group(1), level=2)
                 continue
+            atx = _ATX_HEADING_LINE.match(line)
+            if atx:
+                document.add_heading(atx.group(2).strip(), level=len(atx.group(1)))
+                continue
             bullet = _BULLET_LINE.match(line)
             if bullet:
-                document.add_paragraph(bullet.group(1), style="List Bullet")
+                _add_paragraph_with_inline_bold(document, bullet.group(1), style="List Bullet")
                 continue
             if _NUMBERED_LINE.match(line):
-                document.add_paragraph(line, style="List Paragraph")
+                _add_paragraph_with_inline_bold(document, line, style="List Paragraph")
                 continue
-            document.add_paragraph(line)
+            _add_paragraph_with_inline_bold(document, line)
     buffer = io.BytesIO()
     document.save(buffer)
     buffer.seek(0)
     return buffer
 
 
+def answer_filename(base_name: str | None) -> str:
+    """Осмысленное имя файла: тип ответа + дата-время; если ответ относится к
+    присланному документу — его имя за основу."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if base_name:
+        stem = os.path.splitext(base_name)[0]
+        return f"{stem}_ответ_{stamp}.docx"
+    return f"ответ_{stamp}.docx"
+
+
+def answer_preview(text: str, max_chars: int = 600) -> str:
+    """Первые пара абзацев текста — чтобы в чате была видна суть без
+    открытия файла."""
+    preview = "\n\n".join(text.split("\n\n")[:2])
+    if len(preview) > max_chars:
+        preview = preview[:max_chars].rstrip() + "…"
+    return preview
+
+
+async def send_as_text_or_docx(
+    message,
+    text: str,
+    filename: str,
+    header: str,
+    tail: str = "",
+    force_file: bool = False,
+    force_text: bool = False,
+) -> None:
+    """Отправляет text текстом (обычно) или файлом .docx с подписью — если он
+    длиннее FILE_THRESHOLD, либо force_file=True (команда /file).
+    force_text=True — пользователь выключил автовыгрузку (/nofile): всегда текстом.
+    header — краткая подпись к файлу, tail — доп. текст (например, заметки по
+    терминам), уходит в ту же подпись, а если не влезает — отдельным сообщением.
+    """
+    combined_text = f"{text}\n\n{tail}" if tail else text
+
+    if force_text or (not force_file and len(text) <= FILE_THRESHOLD):
+        await deliver(message, combined_text)
+        return
+
+    buffer = build_docx(text)
+    size = buffer.getbuffer().nbytes
+
+    if size > TELEGRAM_DOC_MAX_SIZE:
+        await deliver(
+            message,
+            f"⚠️ Файл превысил лимит Telegram ({human_size(TELEGRAM_DOC_MAX_SIZE)}) "
+            f"— присылаю текстом.\n\n{combined_text}",
+        )
+        return
+
+    caption = f"{header}\n\n{tail}" if tail else header
+    extra = ""
+    if len(caption) > TELEGRAM_CAPTION_MAX_LEN:
+        caption = header
+        extra = tail
+
+    try:
+        await message.reply_document(document=buffer, filename=filename, caption=caption)
+    except Exception:
+        logger.exception("Не удалось отправить файл")
+        await deliver(message, combined_text)
+        return
+
+    if extra:
+        await send_chunks(message, extra)
+
+
 async def deliver_translation(
     message,
+    user_id: int,
     translated: str,
     notes: list[dict],
     target_lang: str,
     base_name: str | None,
     warning: str = "",
+    force_text: bool = False,
 ) -> None:
-    """Отправляет перевод: коротким текстом (≤ TRANSLATE_FILE_THRESHOLD) или
-    файлом .docx с краткой подписью (объём, язык, неоднозначные термины)."""
+    """Отправляет перевод: коротким текстом (≤ FILE_THRESHOLD) или файлом
+    .docx с краткой подписью (объём, язык, неоднозначные термины)."""
     notes_block = format_notes_block(notes)
     tail_parts = [p for p in (notes_block, warning.strip()) if p]
-    tail = ("\n\n" + "\n\n".join(tail_parts)) if tail_parts else ""
-
-    if len(translated) <= TRANSLATE_FILE_THRESHOLD:
-        await deliver(message, translated + tail)
-        return
+    tail = "\n\n".join(tail_parts)
 
     if base_name:
         stem = os.path.splitext(base_name)[0]
@@ -739,35 +881,13 @@ async def deliver_translation(
     else:
         filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{target_lang}.docx"
 
-    buffer = build_translated_docx(translated)
-    size = buffer.getbuffer().nbytes
-
-    if size > TELEGRAM_DOC_MAX_SIZE:
-        await deliver(
-            message,
-            f"⚠️ Файл перевода превысил лимит Telegram "
-            f"({human_size(TELEGRAM_DOC_MAX_SIZE)}) — присылаю текстом.\n\n"
-            f"{translated}{tail}",
-        )
-        return
-
     lang_name = LANG_NAMES.get(target_lang, target_lang)
     header = f"📄 Перевод готов — {lang_name}, {len(translated)} симв."
-    caption = header + tail
-    extra_notes = ""
-    if len(caption) > TELEGRAM_CAPTION_MAX_LEN:
-        caption = header
-        extra_notes = tail.strip()
 
-    try:
-        await message.reply_document(document=buffer, filename=filename, caption=caption)
-    except Exception:
-        logger.exception("Не удалось отправить файл перевода")
-        await deliver(message, translated + tail)
-        return
-
-    if extra_notes:
-        await send_chunks(message, extra_notes)
+    last_answers[user_id] = {"text": translated, "base_name": base_name}
+    await send_as_text_or_docx(
+        message, translated, filename, header, tail, force_text=force_text
+    )
 
 
 def split_for_translation(text: str, max_chars: int) -> list[str]:
@@ -1089,6 +1209,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "причешу текст и (если запись длинная) сделаю краткое резюме;\n"
         "• /tr — включить режим перевода: сообщения и документы переводятся "
         "вместо обсуждения, направление — по языку текста; /tr off — выключить;\n"
+        "• длинный ответ (> 3000 символов) приходит файлом .docx, короткий — "
+        "текстом; /file — отдать последний ответ файлом принудительно; "
+        "/nofile — выключить автовыгрузку файлом до конца сессии;\n"
         "• /raw — сырая расшифровка последнего аудио;\n"
         "• /history — сколько сообщений сохранено;\n"
         "• /reset — очистить историю диалога;\n"
@@ -1115,6 +1238,39 @@ async def tr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "форматирование и нумерацию. Направление перевода определяю "
         "автоматически по языку текста.\n"
         "/tr off — выключить и вернуться к обычному режиму."
+    )
+
+
+async def file_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Принудительно отдаёт последний ответ (чат или перевод) файлом .docx,
+    даже если он короткий (в обход FILE_THRESHOLD и /nofile)."""
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    user_id = update.effective_user.id
+    last = last_answers.get(user_id)
+    if not last:
+        await update.message.reply_text(
+            "Пока нет ответа, который можно отдать файлом — сначала спросите что-нибудь."
+        )
+        return
+    header = f"📄 Последний ответ файлом.\n\n{answer_preview(last['text'])}"
+    await send_as_text_or_docx(
+        update.message, last["text"], answer_filename(last["base_name"]), header,
+        force_file=True,
+    )
+
+
+async def nofile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Выключает автоматическую выгрузку длинных ответов файлом до конца сессии."""
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    nofile_users[update.effective_user.id] = True
+    await update.message.reply_text(
+        "Автовыгрузка длинных ответов файлом выключена до конца сессии "
+        "(перезапуска бота) — теперь всегда текстом. /file по-прежнему можно "
+        "вызвать вручную для последнего ответа."
     )
 
 
@@ -1206,8 +1362,9 @@ async def handle_translate_document(
     translated, notes = result
     target_lang = detect_target_language(text)
     await deliver_translation(
-        update.message, translated, notes, target_lang,
+        update.message, user_id, translated, notes, target_lang,
         base_name=filename, warning=warning,
+        force_text=nofile_users.get(user_id, False),
     )
     if LOG_DIALOG:
         logger.info("[%s] перевод результат («%s»): %s", user_id, filename, translated)
@@ -1419,6 +1576,16 @@ async def get_model_answer(
 
     if LOG_DIALOG:
         logger.info("[%s] бот: %s", user_id, answer)
+
+    # Доставка: коротко — текстом, длинно (> FILE_THRESHOLD) — файлом .docx
+    # с первыми абзацами в подписи. Правило общее для чата и для /tr.
+    base_name = document["filename"] if document else None
+    last_answers[user_id] = {"text": answer, "base_name": base_name}
+    header = f"📄 Ответ длинный — прислал файлом.\n\n{answer_preview(answer)}"
+    await send_as_text_or_docx(
+        update.message, answer, answer_filename(base_name), header,
+        force_text=nofile_users.get(user_id, False),
+    )
     return answer
 
 
@@ -1446,15 +1613,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             translated, notes = result
             target_lang = detect_target_language(text)
             await deliver_translation(
-                update.message, translated, notes, target_lang, base_name=None,
+                update.message, user_id, translated, notes, target_lang, base_name=None,
+                force_text=nofile_users.get(user_id, False),
             )
             if LOG_DIALOG:
                 logger.info("[%s] перевод результат: %s", user_id, translated)
         return
 
-    answer = await get_model_answer(update, context, user_id, text)
-    if answer is not None:
-        await update.message.reply_text(answer)
+    # Доставка (текстом или файлом) уже выполнена внутри get_model_answer.
+    await get_model_answer(update, context, user_id, text)
 
 
 async def _transcribe_and_reply(
@@ -1632,6 +1799,8 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("tr", tr_cmd))
+    app.add_handler(CommandHandler("file", file_cmd))
+    app.add_handler(CommandHandler("nofile", nofile_cmd))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("raw", raw_cmd))
