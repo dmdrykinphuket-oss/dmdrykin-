@@ -2378,9 +2378,10 @@ def main() -> None:
     )
     app.add_error_handler(on_error)
 
-    # Заранее греем модель распознавания речи в фоне, чтобы первое голосовое
-    # не ждало загрузки модели.
-    threading.Thread(target=_get_whisper_model, daemon=True).start()
+    # Локальную модель распознавания речи (faster-whisper) заранее НЕ греем:
+    # основной путь — OpenAI Whisper API, а локальная модель занимает ~640 МБ
+    # и нужна только на запасном пути. Она подгрузится лениво при первом
+    # обращении к нему (см. _get_whisper_model).
 
     logger.info("Бот запущен. Разрешённые пользователи: %s", sorted(ALLOWED_USERS))
     # bootstrap_retries=-1 — при обрыве сети на самом старте (get_me() и т.п.)
