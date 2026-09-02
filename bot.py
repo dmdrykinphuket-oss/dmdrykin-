@@ -142,6 +142,12 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 MAX_FILE_SIZE_MB = 10
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 
+# Для аудиофайлов лимит выше: длинная запись (до MAX_VOICE_SECONDS) в хорошем
+# качестве весит больше 10 МБ, а расшифровка идёт через OpenAI Whisper API
+# (там лимит на файл 25 МБ). 19 МБ — почти у потолка скачивания Telegram (~20 МБ).
+MAX_AUDIO_FILE_SIZE_MB = 19
+MAX_AUDIO_FILE_SIZE = MAX_AUDIO_FILE_SIZE_MB * 1024 * 1024
+
 # Максимум символов текста из документа, который уходит модели.
 # Защищает от гигантских документов и лишних трат (~30 000 токенов).
 MAX_DOC_CHARS = 120_000
@@ -224,8 +230,8 @@ TRANSCRIBE_NOTE_LOCAL = (
 # быстро; ограничение в первую очередь щадит запасной путь — локальная
 # faster-whisper на длинных записях занимает много времени и памяти.
 # Проверка по размеру: голосовое Telegram (OGG Opus, ~20 кбит/с) при 400 с —
-# это ~1 МБ, аудиофайлы упираются в MAX_FILE_SIZE (10 МБ) раньше — и то, и
-# другое заведомо влезает в лимит OpenAI на файл (25 МБ), сжатие не нужно.
+# это ~1 МБ, аудиофайлы упираются в MAX_AUDIO_FILE_SIZE (19 МБ) раньше — и то,
+# и другое влезает в лимит OpenAI на файл (25 МБ), сжатие не нужно.
 MAX_VOICE_SECONDS = 400
 
 # После расшифровки текст прогоняется через модель: чистится орфография,
@@ -2209,10 +2215,10 @@ async def _transcribe_and_reply(
         )
         return
 
-    if tg_object.file_size and tg_object.file_size > MAX_FILE_SIZE:
+    if tg_object.file_size and tg_object.file_size > MAX_AUDIO_FILE_SIZE:
         await update.message.reply_text(
             f"Файл слишком большой ({human_size(tg_object.file_size)}). "
-            f"Максимум — {MAX_FILE_SIZE_MB} МБ."
+            f"Максимум для аудио — {MAX_AUDIO_FILE_SIZE_MB} МБ."
         )
         return
 
@@ -2239,10 +2245,10 @@ async def _transcribe_and_reply(
         await fail("Не удалось скачать файл. Попробуйте ещё раз.")
         return
 
-    if len(audio_bytes) > MAX_FILE_SIZE:
+    if len(audio_bytes) > MAX_AUDIO_FILE_SIZE:
         await fail(
             f"Файл слишком большой ({human_size(len(audio_bytes))}). "
-            f"Максимум — {MAX_FILE_SIZE_MB} МБ."
+            f"Максимум для аудио — {MAX_AUDIO_FILE_SIZE_MB} МБ."
         )
         return
 
