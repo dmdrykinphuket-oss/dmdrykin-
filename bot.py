@@ -90,6 +90,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # нет, инструменты работы с задачами просто не подключаются (см. .env.example).
 CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
 CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
+# ID рабочего пространства (team). Нужен, чтобы clickup_list_tasks читал задачи
+# по всему пространству, а не только из списка по умолчанию. Необязательный:
+# если не задан, список задач ограничивается CLICKUP_LIST_ID.
+CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID")
 CLICKUP_ENABLED = bool(CLICKUP_TOKEN and CLICKUP_LIST_ID)
 
 # Модель Claude, через которую отвечает бот.
@@ -160,6 +164,10 @@ CLICKUP_LIST_LIMIT = 25
 # следующем сообщении пользователя.
 CLICKUP_CONFIRM_TIMEOUT_SECONDS = 15 * 60
 
+# Сколько страниц (по 100 задач) максимум просматриваем на team-эндпоинте,
+# когда читаем задачи по всему пространству.
+CLICKUP_TEAM_MAX_PAGES = 5
+
 # Описание инструментов для модели. clickup_create_task намеренно НЕ создаёт
 # задачу сразу — он готовит черновик, а создание происходит только после
 # подтверждения пользователя в чате (см. _handle_clickup_confirmation).
@@ -198,20 +206,36 @@ CLICKUP_TOOLS = [
     {
         "name": "clickup_list_tasks",
         "description": (
-            "Показать задачи из списка ClickUp по умолчанию. Можно отфильтровать "
-            "по статусу или по сроку."
+            "Показать задачи ClickUp. Если задан ID пространства — читает задачи "
+            "по всему рабочему пространству (все списки), иначе только из списка "
+            "по умолчанию. По умолчанию показывает лишь незакрытые задачи. "
+            "В выводе у каждой задачи указан её список."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "filter": {
+                "status": {
                     "type": "string",
                     "description": (
-                        "Необязательный фильтр. Либо название статуса "
-                        "(например «open», «in progress», «closed»), либо один "
-                        "из ключей срока: overdue/просроченные, today/сегодня, "
-                        "tomorrow/завтра, week/неделя, no_due/без срока. "
-                        "Пусто — показать все задачи."
+                        "Фильтр по статусу: «open», «in progress», «closed» и т.п. "
+                        "Значение «all» — показать задачи со всеми статусами, "
+                        "включая закрытые. Пусто — только незакрытые."
+                    ),
+                },
+                "due": {
+                    "type": "string",
+                    "description": (
+                        "Фильтр по сроку, один из ключей: overdue/просроченные, "
+                        "today/сегодня, tomorrow/завтра, week/неделя, "
+                        "no_due/без срока. Пусто — без фильтра по сроку."
+                    ),
+                },
+                "list": {
+                    "type": "string",
+                    "description": (
+                        "Фильтр по списку: часть названия списка (без учёта "
+                        "регистра) или числовой ID списка. Пусто — все списки "
+                        "пространства."
                     ),
                 },
             },
@@ -460,57 +484,166 @@ async def clickup_create_task_now(draft: dict) -> tuple[str | None, str | None]:
     return url, None
 
 
-async def _clickup_list_tasks(tool_input: dict) -> str:
-    """Список задач с необязательным фильтром по статусу или сроку."""
-    filt = (tool_input.get("filter") or "").strip().lower()
-    now = datetime.now()
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+# Ключи фильтра по сроку -> (доп. query-параметры, пометка, только-без-срока).
+# Возвращает None, если ключ не про срок.
+_CLICKUP_DUE_KEYS = {
+    "overdue": "overdue", "просроченные": "overdue", "просрочено": "overdue",
+    "просрочка": "overdue", "просрочены": "overdue",
+    "today": "today", "сегодня": "today",
+    "tomorrow": "tomorrow", "завтра": "tomorrow",
+    "week": "week", "неделя": "week", "неделю": "week",
+    "на этой неделе": "week", "эта неделя": "week",
+    "no_due": "no_due", "no due": "no_due", "без срока": "no_due",
+    "бессрочные": "no_due",
+}
 
+
+def _clickup_due_params(
+    key: str, day_start: datetime
+) -> tuple[list[tuple[str, str]], str, bool] | None:
     def ms(d: datetime) -> str:
         return str(int(d.timestamp() * 1000))
 
+    norm = _CLICKUP_DUE_KEYS.get(key.strip().lower())
+    if norm is None:
+        return None
+    if norm == "overdue":
+        return [("due_date_lt", ms(day_start))], "просроченные", False
+    if norm == "today":
+        return (
+            [("due_date_gt", ms(day_start - timedelta(seconds=1))),
+             ("due_date_lt", ms(day_start + timedelta(days=1)))],
+            "со сроком сегодня", False,
+        )
+    if norm == "tomorrow":
+        return (
+            [("due_date_gt", ms(day_start + timedelta(days=1) - timedelta(seconds=1))),
+             ("due_date_lt", ms(day_start + timedelta(days=2)))],
+            "со сроком завтра", False,
+        )
+    if norm == "week":
+        return [("due_date_lt", ms(day_start + timedelta(days=7)))], "со сроком в ближайшую неделю", False
+    # no_due — фильтруем на нашей стороне (у API нет параметра «без срока»)
+    return [], "без срока", True
+
+
+# Статусы, которые считаем «закрытыми» — для них нужен include_closed=true.
+_CLICKUP_CLOSED_STATUSES = {
+    "closed", "done", "complete", "completed", "resolved",
+    "закрыт", "закрыта", "закрытые", "закрыто", "выполнено", "готово",
+}
+
+
+async def _clickup_fetch_team_tasks(
+    base_params: list[tuple[str, str]]
+) -> tuple[list, str | None]:
+    """Задачи по всему пространству (team-эндпоинт) с постраничной подгрузкой.
+    Возвращает (список_задач, текст_ошибки)."""
+    all_tasks: list = []
+    for page in range(CLICKUP_TEAM_MAX_PAGES):
+        data, err = await _clickup_request(
+            "GET", f"/team/{CLICKUP_TEAM_ID}/task",
+            params=base_params + [("page", str(page))],
+        )
+        if err:
+            return [], err
+        chunk = data.get("tasks", []) if isinstance(data, dict) else []
+        all_tasks += chunk
+        if data.get("last_page") or len(chunk) < 100:
+            break
+    return all_tasks, None
+
+
+async def _clickup_list_tasks(tool_input: dict) -> str:
+    """Список задач ClickUp. С CLICKUP_TEAM_ID — по всему пространству (все
+    списки), иначе только из списка по умолчанию. Фильтры: статус, срок, список.
+    По умолчанию показываются только незакрытые задачи."""
+    now = datetime.now()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    status = (tool_input.get("status") or "").strip().lower()
+    due = (tool_input.get("due") or "").strip().lower()
+    list_filter = (tool_input.get("list") or "").strip()
+    # Обратная совместимость: старый одиночный параметр filter.
+    legacy = (tool_input.get("filter") or "").strip().lower()
+    if legacy and not status and not due:
+        if _CLICKUP_DUE_KEYS.get(legacy):
+            due = legacy
+        else:
+            status = legacy
+
     params: list[tuple[str, str]] = []
+    notes: list[str] = []
     only_no_due = False
-    note = "все задачи"
+    include_closed = False
 
-    if filt in ("overdue", "просроченные", "просрочено", "просрочка", "просрочены"):
-        params += [("due_date_lt", ms(day_start)), ("include_closed", "false")]
-        note = "просроченные"
-    elif filt in ("today", "сегодня"):
-        params += [("due_date_gt", ms(day_start - timedelta(seconds=1))),
-                   ("due_date_lt", ms(day_start + timedelta(days=1)))]
-        note = "со сроком сегодня"
-    elif filt in ("tomorrow", "завтра"):
-        params += [("due_date_gt", ms(day_start + timedelta(days=1) - timedelta(seconds=1))),
-                   ("due_date_lt", ms(day_start + timedelta(days=2)))]
-        note = "со сроком завтра"
-    elif filt in ("week", "неделя", "на этой неделе", "эта неделя", "неделю"):
-        params += [("due_date_lt", ms(day_start + timedelta(days=7)))]
-        note = "со сроком в ближайшую неделю"
-    elif filt in ("no_due", "без срока", "бессрочные", "no due"):
-        only_no_due = True
-        note = "без срока"
-    elif filt:
-        params.append(("statuses[]", filt))
-        note = f"со статусом «{filt}»"
+    if due:
+        parsed = _clickup_due_params(due, day_start)
+        if parsed is None:
+            return (
+                f"Не понял фильтр по сроку «{due}». Допустимо: просроченные, "
+                "сегодня, завтра, неделя, без срока."
+            )
+        due_params, due_note, only_no_due = parsed
+        params += due_params
+        notes.append(due_note)
 
-    data, err = await _clickup_request(
-        "GET", f"/list/{CLICKUP_LIST_ID}/task", params=params or None
-    )
+    if status in ("all", "все", "любой", "любые", "с закрытыми", "any"):
+        include_closed = True
+        notes.append("все статусы")
+    elif status:
+        params.append(("statuses[]", status))
+        notes.append(f"статус «{status}»")
+        if status in _CLICKUP_CLOSED_STATUSES:
+            include_closed = True
+
+    params.append(("include_closed", "true" if include_closed else "false"))
+
+    list_id_filter = list_filter if list_filter.isdigit() else ""
+    list_name_filter = "" if list_filter.isdigit() else list_filter.lower()
+
+    if CLICKUP_TEAM_ID:
+        scope_note = "по всему пространству"
+        if list_id_filter:
+            params.append(("list_ids[]", list_id_filter))
+            notes.append(f"список {list_id_filter}")
+        elif list_name_filter:
+            notes.append(f"список ~«{list_filter}»")
+        tasks, err = await _clickup_fetch_team_tasks(params)
+    else:
+        scope_note = "из списка по умолчанию"
+        if list_filter:
+            notes.append("фильтр по списку не применён — нет CLICKUP_TEAM_ID")
+        list_name_filter = ""  # в одном списке фильтровать не по чему
+        data, err = await _clickup_request(
+            "GET", f"/list/{CLICKUP_LIST_ID}/task", params=params
+        )
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+
     if err:
         return err
-    tasks = data.get("tasks", []) if isinstance(data, dict) else []
+
     if only_no_due:
         tasks = [t for t in tasks if not t.get("due_date")]
-    if not tasks:
-        return f"В списке нет задач ({note})."
+    if list_name_filter:
+        tasks = [
+            t for t in tasks
+            if list_name_filter in ((t.get("list") or {}).get("name") or "").lower()
+        ]
 
-    lines = [f"Задачи ({note}) — всего {len(tasks)}:"]
+    head = ", ".join([scope_note] + notes)
+    if not tasks:
+        return f"Задач не найдено ({head})."
+
+    lines = [f"Задачи ({head}) — всего {len(tasks)}:"]
     for t in tasks[:CLICKUP_LIST_LIMIT]:
-        status = (t.get("status") or {}).get("status", "?")
-        due = _fmt_ts(t.get("due_date")) if t.get("due_date") else ""
-        due_str = f", срок {due}" if due else ""
-        lines.append(f"• [{t.get('id')}] {t.get('name')} — {status}{due_str}")
+        st = (t.get("status") or {}).get("status", "?")
+        due_s = _fmt_ts(t.get("due_date")) if t.get("due_date") else ""
+        due_str = f", срок {due_s}" if due_s else ""
+        list_name = (t.get("list") or {}).get("name") or "?"
+        lines.append(
+            f"• [{t.get('id')}] {t.get('name')} — {st}{due_str} · список: {list_name}"
+        )
     if len(tasks) > CLICKUP_LIST_LIMIT:
         lines.append(f"…и ещё {len(tasks) - CLICKUP_LIST_LIMIT} — уточните фильтр.")
     return "\n".join(lines)
@@ -703,7 +836,10 @@ SYSTEM_PROMPT = (
 # Добавка к системному промпту, когда подключён ClickUp.
 CLICKUP_SYSTEM_PROMPT = (
     " У тебя есть инструменты ClickUp: clickup_create_task — подготовить задачу, "
-    "clickup_list_tasks — список задач, clickup_get_task — детали задачи. "
+    "clickup_list_tasks — список задач (по всему пространству, если настроено; "
+    "фильтры: статус, срок, список; по умолчанию только незакрытые), "
+    "clickup_get_task — детали задачи. "
+    "Новые задачи создаются только в списке по умолчанию. "
     "Менять и удалять задачи ты не можешь — таких инструментов нет. "
     "clickup_create_task НЕ создаёт задачу сразу: он готовит черновик. "
     "После вызова покажи пользователю название, описание и срок задачи и дождись "
@@ -2979,7 +3115,15 @@ def main() -> None:
     )
 
     if CLICKUP_ENABLED:
-        logger.info("ClickUp подключён: задачи создаются в списке %s", CLICKUP_LIST_ID)
+        scope = (
+            f"список задач — по пространству {CLICKUP_TEAM_ID}"
+            if CLICKUP_TEAM_ID else
+            "список задач — только из списка по умолчанию (нет CLICKUP_TEAM_ID)"
+        )
+        logger.info(
+            "ClickUp подключён: создание задач в списке %s; %s",
+            CLICKUP_LIST_ID, scope,
+        )
     else:
         logger.info(
             "ClickUp выключен: не заданы CLICKUP_TOKEN и/или CLICKUP_LIST_ID в .env"
