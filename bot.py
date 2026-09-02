@@ -9,6 +9,13 @@
 - при перезапуске продолжает диалог с того места, где остановились;
 - принимает файлы PDF, DOCX и TXT: извлекает текст и держит документ в контексте,
   пока пользователь задаёт по нему вопросы;
+- принимает изображения — и как фото из телеграма, и присланные документом
+  (jpg, png, webp): передаёт их модели вместе с подписью к фото; если подписи
+  нет — просто просит прокомментировать изображение. Картинки остаются в
+  контексте (не больше MAX_IMAGES_IN_CONTEXT штук), можно задавать по ним
+  несколько вопросов подряд. Если фото пришло альбомом — все кадры уходят
+  модели одним запросом. Из нескольких размеров, что шлёт Telegram, берётся
+  самый большой;
 - принимает голосовые и аудиофайлы (m4a, mp3, …), в том числе присланные
   документом: расшифровывает их локально через faster-whisper (модель small,
   русский), затем прогоняет текст через claude-sonnet-5 — чистит орфографию,
@@ -24,7 +31,7 @@
   (объём, язык, неоднозначные термины); /tr off выключает режим;
 - команда /reset очищает историю пользователя, /history показывает её размер,
   /raw показывает сырую расшифровку последнего аудио,
-  /forget убирает документ из контекста;
+  /forget убирает документ и изображения из контекста;
 - умеет искать в интернете (web_search) и показывает ссылки на источники;
 - если Anthropic API вернул ошибку — бот пишет об этом в чат и продолжает работать.
 
@@ -32,6 +39,7 @@
 """
 
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -131,6 +139,32 @@ MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 # Защищает от гигантских документов и лишних трат (~30 000 токенов).
 MAX_DOC_CHARS = 120_000
 
+# --- Изображения -------------------------------------------------------
+# Принимаем фото из телеграма и картинки, присланные документом.
+SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+IMAGE_MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+# Максимальный размер одного изображения. API Anthropic принимает картинки
+# не больше 5 МБ (в base64), поэтому лимит здесь ниже, чем для документов.
+MAX_IMAGE_SIZE_MB = 5
+MAX_IMAGE_SIZE = MAX_IMAGE_SIZE_MB * 1024 * 1024
+
+# Сколько изображений держим в контексте одного пользователя. Новые
+# вытесняют самые старые — иначе контекст (и траты) растут бесконтрольно.
+MAX_IMAGES_IN_CONTEXT = 4
+
+# Фото из альбома приходят разными апдейтами с общим media_group_id. Ждём
+# столько секунд после последнего кадра, потом обрабатываем альбом целиком.
+ALBUM_SETTLE_SECONDS = 2.0
+
+# Что спросить у модели, если фото прислали без подписи.
+IMAGE_NO_CAPTION_PROMPT = "Что на этом изображении? Опиши и отметь важное."
+
 # --- Режим перевода (/tr) ------------------------------------------------
 # Длинные тексты режем на части такого размера (по границам абзацев) и
 # переводим по очереди, но в одной «сессии» — прошлые фрагменты и их перевод
@@ -183,7 +217,9 @@ SYSTEM_PROMPT = (
     "на том же языке, на котором пишет пользователь. "
     "Если вопрос требует свежих или проверяемых фактов — используй веб-поиск. "
     "Если ответ ты и так знаешь — отвечай сразу, без поиска. "
-    "Если пользователь прислал документ — отвечай на вопросы, опираясь на него."
+    "Если пользователь прислал документ — отвечай на вопросы, опираясь на него. "
+    "Если пользователь прислал изображение — рассмотри его и отвечай по нему; "
+    "когда к фото есть подпись — это и есть вопрос или задача по картинке."
 )
 
 
@@ -287,6 +323,14 @@ async def warn_if_context_large(update: Update, context_tokens: int | None) -> N
 # Активный документ каждого пользователя (в памяти, при перезапуске сбрасывается):
 # {telegram_id: {"filename": str, "text": str, "size": int (байт)}}
 documents: dict[int, dict] = {}
+
+# Изображения в контексте каждого пользователя (в памяти, сбрасываются при
+# перезапуске): {telegram_id: [{"media_type": str, "data": str (base64), "size": int}]}.
+# Не больше MAX_IMAGES_IN_CONTEXT штук — новые вытесняют самые старые.
+images: dict[int, list[dict]] = {}
+
+# Буфер альбомов: {media_group_id: {"items": [(tg_object, media_type)], ...}}.
+_album_buffers: dict[str, dict] = {}
 
 # Сырая расшифровка последнего аудио каждого пользователя — для команды /raw
 # (в памяти; в чат не выводится).
@@ -1200,36 +1244,58 @@ async def send_chunks(message, text: str) -> None:
         await message.reply_text(chunk.strip())
 
 
-def _build_messages(history: list[dict], document: dict | None) -> list[dict]:
-    """Собирает список сообщений для API. Если есть документ — подкладывает его в начало."""
-    if not document:
+def _build_messages(
+    history: list[dict],
+    document: dict | None,
+    image_list: list[dict] | None = None,
+) -> list[dict]:
+    """Собирает список сообщений для API. Документ и/или изображения (если есть)
+    подкладываются отдельной парой реплик в начало — так они остаются в
+    контексте, пока пользователь задаёт по ним вопросы."""
+    if not document and not image_list:
         return list(history)
-    doc_block = {
-        "type": "document",
-        "source": {
+
+    intro: list[dict] = []
+    if document:
+        intro.append({
+            "type": "document",
+            "source": {
+                "type": "text",
+                "media_type": "text/plain",
+                "data": document["text"],
+            },
+            "title": document["filename"],
+            # Кэшируем документ: повторные вопросы по нему обходятся дешевле.
+            "cache_control": {"type": "ephemeral"},
+        })
+        intro.append({
             "type": "text",
-            "media_type": "text/plain",
-            "data": document["text"],
-        },
-        "title": document["filename"],
-        # Кэшируем документ: повторные вопросы по нему обходятся заметно дешевле.
-        "cache_control": {"type": "ephemeral"},
-    }
-    preamble = [
-        {
-            "role": "user",
-            "content": [
-                doc_block,
-                {
-                    "type": "text",
-                    "text": (
-                        f"Пользователь прислал файл «{document['filename']}». "
-                        "Отвечай на его вопросы, опираясь на этот документ."
-                    ),
+            "text": (
+                f"Пользователь прислал файл «{document['filename']}». "
+                "Отвечай на его вопросы, опираясь на этот документ."
+            ),
+        })
+    if image_list:
+        for img in image_list:
+            intro.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img["media_type"],
+                    "data": img["data"],
                 },
-            ],
-        },
-        {"role": "assistant", "content": "Документ получен. Задавайте вопросы по нему."},
+            })
+        intro.append({
+            "type": "text",
+            "text": (
+                f"Пользователь прислал изображения (всего {len(image_list)}) — они выше. "
+                "Отвечай на вопросы по ним; учитывай подпись к фото, если она есть."
+            ),
+        })
+
+    preamble = [
+        {"role": "user", "content": intro},
+        {"role": "assistant", "content": "Материалы получил. Задавайте вопросы по ним."},
     ]
     return preamble + list(history)
 
@@ -1284,14 +1350,15 @@ def _responses_text(responses: list) -> str:
 
 
 async def _run_conversation(
-    history: list[dict], use_web_search: bool, document: dict | None, on_progress=None
+    history: list[dict], use_web_search: bool, document: dict | None,
+    image_list: list[dict] | None = None, on_progress=None
 ) -> list:
     """Запрос к модели (потоково). Возвращает список Message по цепочке:
     - если ответ «встал на паузу» посреди поиска (pause_turn) — продолжаем;
     - если упёрлись в max_tokens посреди ответа — тоже продолжаем (явной
       просьбой «продолжи»), до MAX_CONTINUATIONS раз; куски склеивает
       _extract_answer, так что ответ доходит до конца, а не обрывается."""
-    messages = _build_messages(history, document)
+    messages = _build_messages(history, document, image_list)
     responses: list = []
 
     async def progress_wrapper(chunk_text: str) -> None:
@@ -1387,8 +1454,11 @@ def _extract_answer(responses: list) -> str:
     return answer
 
 
-async def ask_claude(history: list[dict], document: dict | None = None, on_progress=None):
-    """Отправляет историю (и документ, если есть) в Claude — потоково, с
+async def ask_claude(
+    history: list[dict], document: dict | None = None,
+    image_list: list[dict] | None = None, on_progress=None
+):
+    """Отправляет историю (и документ / изображения, если есть) в Claude — потоково, с
     ограничением по времени (GENERATION_TIMEOUT_SECONDS).
 
     Сначала пробуем с веб-поиском. Если поиск недоступен (например, не включён
@@ -1399,13 +1469,15 @@ async def ask_claude(history: list[dict], document: dict | None = None, on_progr
     """
     try:
         responses = await asyncio.wait_for(
-            _run_conversation(history, use_web_search=True, document=document, on_progress=on_progress),
+            _run_conversation(history, use_web_search=True, document=document,
+                              image_list=image_list, on_progress=on_progress),
             timeout=GENERATION_TIMEOUT_SECONDS,
         )
     except anthropic.BadRequestError:
         logger.warning("Веб-поиск недоступен — отвечаю без него", exc_info=True)
         responses = await asyncio.wait_for(
-            _run_conversation(history, use_web_search=False, document=document, on_progress=on_progress),
+            _run_conversation(history, use_web_search=False, document=document,
+                              image_list=image_list, on_progress=on_progress),
             timeout=GENERATION_TIMEOUT_SECONDS,
         )
     return _extract_answer(responses), responses
@@ -1424,6 +1496,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! Я отвечаю с помощью Claude.\n\n"
         "• просто напишите сообщение — отвечу, при необходимости поищу в интернете;\n"
         "• пришлите файл PDF, DOCX или TXT — и задавайте вопросы по нему;\n"
+        "• пришлите картинку (фото или файлом jpg/png/webp) — с подписью отвечу "
+        "на неё, без подписи просто прокомментирую; фото остаётся в контексте, "
+        "можно задавать вопросы подряд; альбом обрабатываю целиком;\n"
         "• запишите голосовое или пришлите аудиофайл — я расшифрую его, "
         "причешу текст и (если запись длинная) сделаю краткое резюме;\n"
         "• /tr — включить режим перевода: сообщения и документы переводятся "
@@ -1434,7 +1509,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /raw — сырая расшифровка последнего аудио;\n"
         "• /history — сколько сообщений сохранено;\n"
         "• /reset — очистить историю диалога;\n"
-        "• /forget — убрать документ из контекста."
+        "• /forget — убрать документ и изображения из контекста."
     )
 
 
@@ -1538,13 +1613,24 @@ async def forget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return
-    removed = documents.pop(update.effective_user.id, None)
-    if removed:
+    user_id = update.effective_user.id
+    removed_doc = documents.pop(user_id, None)
+    removed_imgs = images.pop(user_id, None)
+
+    parts = []
+    if removed_doc:
+        parts.append(f"документ «{removed_doc['filename']}»")
+    if removed_imgs:
+        parts.append(f"изображения ({len(removed_imgs)} шт.)")
+
+    if parts:
         await update.message.reply_text(
-            f"Документ «{removed['filename']}» убран из контекста."
+            "Убрано из контекста: " + ", ".join(parts) + "."
         )
     else:
-        await update.message.reply_text("Сейчас в контексте нет документа.")
+        await update.message.reply_text(
+            "Сейчас в контексте нет ни документа, ни изображений."
+        )
 
 
 async def handle_translate_document(
@@ -1597,6 +1683,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     tg_doc = update.message.document
     filename = tg_doc.file_name or "файл"
     extension = os.path.splitext(filename)[1].lower()
+
+    # Картинка, присланная документом (jpg/png/webp) — уходит по пути изображений.
+    if extension in SUPPORTED_IMAGE_EXTENSIONS:
+        media_type = IMAGE_MEDIA_TYPES.get(extension, "image/jpeg")
+        caption = (update.message.caption or "").strip()
+        if update.message.media_group_id:
+            _buffer_album_item(update, context, tg_doc, media_type)
+        else:
+            await _process_images(update, context, [(tg_doc, media_type)], caption)
+        return
 
     if extension not in SUPPORTED_EXTENSIONS:
         await update.message.reply_text(
@@ -1677,13 +1773,150 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фото, аудио-файлы, видео и прочее, что бот пока не умеет читать."""
+    """Видео и прочее, что бот пока не умеет читать."""
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
         return
     await update.message.reply_text(
-        "Пока я умею работать только с текстом, голосовыми и файлами PDF, DOCX и TXT."
+        "Пока я умею работать с текстом, картинками, голосовыми и файлами PDF, DOCX и TXT."
     )
+
+
+# --- Изображения: скачивание, контекст, альбомы -------------------------
+
+async def _download_image(tg_object, media_type: str, on_error) -> dict | None:
+    """Скачивает изображение из Telegram и готовит блок для API (base64).
+    None и сообщение через on_error — если файл слишком большой или не скачался."""
+    if tg_object.file_size and tg_object.file_size > MAX_IMAGE_SIZE:
+        await on_error(
+            f"Изображение слишком большое ({human_size(tg_object.file_size)}). "
+            f"Максимум — {MAX_IMAGE_SIZE_MB} МБ."
+        )
+        return None
+    try:
+        tg_file = await tg_object.get_file()
+        data = bytes(await tg_file.download_as_bytearray())
+    except Exception:
+        logger.exception("Не удалось скачать изображение из Telegram")
+        await on_error("Не получилось скачать изображение. Попробуйте ещё раз.")
+        return None
+    if len(data) > MAX_IMAGE_SIZE:
+        await on_error(
+            f"Изображение слишком большое ({human_size(len(data))}). "
+            f"Максимум — {MAX_IMAGE_SIZE_MB} МБ."
+        )
+        return None
+    return {
+        "media_type": media_type,
+        "data": base64.b64encode(data).decode("ascii"),
+        "size": len(data),
+    }
+
+
+def add_images_to_context(user_id: int, new_images: list[dict]) -> int:
+    """Кладёт изображения в контекст пользователя, соблюдая лимит
+    MAX_IMAGES_IN_CONTEXT (лишние старые вытесняются). Возвращает число
+    вытесненных изображений."""
+    store = images.setdefault(user_id, [])
+    store.extend(new_images)
+    dropped = max(0, len(store) - MAX_IMAGES_IN_CONTEXT)
+    if dropped:
+        del store[:dropped]
+    return dropped
+
+
+async def _process_images(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    items: list[tuple],
+    caption: str,
+) -> None:
+    """items — список (tg_object, media_type). Скачивает картинки, кладёт их в
+    контекст пользователя и спрашивает модель: с подписью пользователя, а если
+    подписи нет — просит свободно прокомментировать изображение."""
+    user_id = update.effective_user.id
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    )
+
+    async def on_error(text: str) -> None:
+        await _safe(update.message.reply_text(text))
+
+    new_images: list[dict] = []
+    for tg_object, media_type in items:
+        img = await _download_image(tg_object, media_type, on_error)
+        if img:
+            new_images.append(img)
+
+    if not new_images:
+        return
+
+    dropped = add_images_to_context(user_id, new_images)
+    total = len(images.get(user_id, []))
+
+    if LOG_DIALOG:
+        logger.info(
+            "[%s] изображения: +%s (в контексте %s), подпись=%r",
+            user_id, len(new_images), total, caption,
+        )
+
+    if dropped:
+        await _safe(update.message.reply_text(
+            f"В контексте держу не больше {MAX_IMAGES_IN_CONTEXT} изображений — "
+            f"{dropped} самых старых убрал. /forget — очистить полностью."
+        ))
+
+    prompt = caption or IMAGE_NO_CAPTION_PROMPT
+    await get_model_answer(update, context, user_id, prompt)
+
+
+def _buffer_album_item(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tg_object,
+    media_type: str,
+) -> None:
+    """Копит кадры одного альбома (общий media_group_id) и запускает их
+    обработку одним запросом через ALBUM_SETTLE_SECONDS после последнего кадра."""
+    mgid = update.message.media_group_id
+    buf = _album_buffers.get(mgid)
+    if buf is None:
+        buf = {"items": [], "caption": "", "update": update, "context": context, "task": None}
+        _album_buffers[mgid] = buf
+    buf["items"].append((tg_object, media_type))
+    caption = (update.message.caption or "").strip()
+    if caption:
+        buf["caption"] = caption
+    if buf["task"]:
+        buf["task"].cancel()
+    buf["task"] = asyncio.create_task(_flush_album(mgid))
+
+
+async def _flush_album(mgid: str) -> None:
+    try:
+        await asyncio.sleep(ALBUM_SETTLE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    buf = _album_buffers.pop(mgid, None)
+    if not buf:
+        return
+    try:
+        await _process_images(buf["update"], buf["context"], buf["items"], buf["caption"])
+    except Exception:
+        logger.exception("Ошибка обработки альбома")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фото из Telegram. Telegram шлёт несколько размеров — берём самый большой."""
+    if not is_allowed(update):
+        await update.message.reply_text(DENY_TEXT)
+        return
+    photo = update.message.photo[-1]  # последний в списке — максимальный размер
+    if update.message.media_group_id:
+        _buffer_album_item(update, context, photo, "image/jpeg")
+        return
+    caption = (update.message.caption or "").strip()
+    await _process_images(update, context, [(photo, "image/jpeg")], caption)
 
 
 async def get_model_answer(
@@ -1696,6 +1929,7 @@ async def get_model_answer(
     None (бот не падает).
     """
     document = documents.get(user_id)
+    image_list = images.get(user_id) or None
 
     # Контекст для модели: последние сообщения из БД + текущий вопрос.
     history = db_recent_messages(user_id, MAX_HISTORY_MESSAGES - 1)
@@ -1703,7 +1937,8 @@ async def get_model_answer(
 
     if LOG_DIALOG:
         doc_note = f" [документ: {document['filename']}]" if document else ""
-        logger.info("[%s] пользователь%s: %s", user_id, doc_note, user_text)
+        img_note = f" [изображений: {len(image_list)}]" if image_list else ""
+        logger.info("[%s] пользователь%s%s: %s", user_id, doc_note, img_note, user_text)
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
@@ -1713,7 +1948,7 @@ async def get_model_answer(
     # если он близок к лимиту модели, и логируем в любом случае.
     # (web_search — server tool, count_tokens его не принимает — считаем без tools.)
     context_tokens = await count_context_tokens(
-        MODEL, SYSTEM_PROMPT, _build_messages(history, document)
+        MODEL, SYSTEM_PROMPT, _build_messages(history, document, image_list)
     )
     await warn_if_context_large(update, context_tokens)
     if context_tokens is not None:
@@ -1738,7 +1973,9 @@ async def get_model_answer(
         await _safe(status.edit_text(f"✍️ Генерирую ответ… ({len(text_so_far)} симв.)\n\n…{preview}"))
 
     try:
-        answer, responses = await ask_claude(history, document, on_progress=progress)
+        answer, responses = await ask_claude(
+            history, document, image_list, on_progress=progress
+        )
     except (asyncio.TimeoutError, TimeoutError):
         logger.warning("Генерация превысила таймаут (%s с)", GENERATION_TIMEOUT_SECONDS)
         if status is not None:
@@ -2033,9 +2270,10 @@ def main() -> None:
             filters.AUDIO | filters.Document.Category("audio/"), handle_audio
         )
     )
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(
-        MessageHandler(filters.PHOTO | filters.VIDEO, handle_unsupported)
+        MessageHandler(filters.VIDEO, handle_unsupported)
     )
     app.add_error_handler(on_error)
 
