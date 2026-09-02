@@ -422,6 +422,10 @@ async def _clickup_prepare_task(user_id: int, tool_input: dict) -> str:
         "due_human": due_human,
         "ts": time.monotonic(),  # для таймаута ожидания подтверждения
     }
+    logger.info(
+        "[%s] ClickUp: подготовлен черновик задачи (описание: %s, срок: %s)",
+        user_id, "да" if description else "нет", "да" if due_human else "нет",
+    )
     lines = [
         "Черновик задачи готов и ждёт подтверждения пользователя. Задача ещё НЕ создана.",
         f"Название: {name}",
@@ -566,6 +570,9 @@ async def run_clickup_tool(
         "ClickUp API вернул", "Не удалось связаться с ClickUp",
         "ClickUp не настроен", "Ошибка:",
     ))
+    logger.info(
+        "[%s] ClickUp: %s — %s", user_id, name, "ошибка" if is_error else "ок"
+    )
     return text, is_error
 
 
@@ -678,9 +685,10 @@ TRANSCRIPT_SUMMARY_THRESHOLD = 400
 MAX_TRANSCRIPT_CHARS = 12_000
 
 # --- Логирование диалога ----------------------------------------------
-# Если True — весь диалог (сообщения пользователя и ответы Claude) пишется
-# в лог целиком, открытым текстом. Поставьте False, чтобы отключить.
-LOG_DIALOG = True
+# В общий лог (журнал systemd) пишем ТОЛЬКО метаданные обработки: id
+# пользователя, тип запроса, объём (символы/байты/токены) и результат.
+# Тексты сообщений, расшифровки голосовых и ответы модели в лог не попадают.
+# Полная переписка хранится только в history.db (см. get_db).
 
 SYSTEM_PROMPT = (
     "Ты дружелюбный ассистент в Telegram. Отвечай кратко и по делу, "
@@ -1779,7 +1787,7 @@ async def deliver(message, text: str, retries: int = 3) -> bool:
                 exc_info=True,
             )
             await asyncio.sleep(2 * (attempt + 1))
-    logger.error("Ответ так и не отправлен, текст: %s", text[:500])
+    logger.error("Ответ так и не отправлен (%s симв.)", len(text))
     return False
 
 
@@ -2259,8 +2267,7 @@ async def handle_translate_document(
             f"(~{MAX_DOC_CHARS // 1000} тыс. символов)."
         )
 
-    if LOG_DIALOG:
-        logger.info("[%s] перевод (документ «%s»): %s байт", user_id, filename, len(text))
+    logger.info("[%s] запрос: перевод документа, %s симв.", user_id, len(text))
 
     status = None
     try:
@@ -2285,8 +2292,9 @@ async def handle_translate_document(
         base_name=filename, warning=warning,
         force_text=nofile_users.get(user_id, False),
     )
-    if LOG_DIALOG:
-        logger.info("[%s] перевод результат («%s»): %s", user_id, filename, translated)
+    logger.info(
+        "[%s] готово: перевод документа, %s симв.", user_id, len(translated)
+    )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2468,11 +2476,11 @@ async def _process_images(
     dropped = add_images_to_context(user_id, new_images)
     total = len(images.get(user_id, []))
 
-    if LOG_DIALOG:
-        logger.info(
-            "[%s] изображения: +%s (в контексте %s), подпись=%r",
-            user_id, len(new_images), total, caption,
-        )
+    logger.info(
+        "[%s] запрос: изображения +%s (в контексте %s), подпись: %s",
+        user_id, len(new_images), total,
+        f"{len(caption)} симв." if caption else "нет",
+    )
 
     if dropped:
         await _safe(update.message.reply_text(
@@ -2549,10 +2557,12 @@ async def get_model_answer(
     history = db_recent_messages(user_id, MAX_HISTORY_MESSAGES - 1)
     history.append({"role": "user", "content": user_text})
 
-    if LOG_DIALOG:
-        doc_note = f" [документ: {document['filename']}]" if document else ""
-        img_note = f" [изображений: {len(image_list)}]" if image_list else ""
-        logger.info("[%s] пользователь%s%s: %s", user_id, doc_note, img_note, user_text)
+    doc_note = f" +документ ({len(document['text'])} симв.)" if document else ""
+    img_note = f" +изображений: {len(image_list)}" if image_list else ""
+    logger.info(
+        "[%s] запрос к модели: %s симв.%s%s",
+        user_id, len(user_text), doc_note, img_note,
+    )
 
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action=ChatAction.TYPING
@@ -2644,8 +2654,7 @@ async def get_model_answer(
         output_tokens=sum(getattr(r.usage, "output_tokens", 0) or 0 for r in responses),
     )
 
-    if LOG_DIALOG:
-        logger.info("[%s] бот: %s", user_id, answer)
+    logger.info("[%s] ответ модели готов: %s симв.", user_id, len(answer))
 
     # Доставка: коротко — текстом, длинно (> FILE_THRESHOLD) — файлом .docx
     # с первыми абзацами в подписи. Правило общее для чата и для /tr.
@@ -2690,6 +2699,7 @@ async def _handle_clickup_confirmation(
         )
         await update.message.reply_text(note)
         db_add_message(user_id, "assistant", note)
+        logger.info("[%s] ClickUp: черновик снят по таймауту", user_id)
         return False
 
     answer = (text or "").strip().lower().rstrip("!.")
@@ -2704,8 +2714,7 @@ async def _handle_clickup_confirmation(
             await update.message.reply_text(reply)
             db_add_message(user_id, "user", text)
             db_add_message(user_id, "assistant", reply)
-            if LOG_DIALOG:
-                logger.info("[%s] ClickUp: %s", user_id, reply)
+            logger.info("[%s] ClickUp: создание задачи — ошибка API", user_id)
             return True
         pending_clickup_tasks.pop(user_id, None)
         reply = f"✅ Задача создана: {draft['name']}"
@@ -2717,8 +2726,10 @@ async def _handle_clickup_confirmation(
         await update.message.reply_text(reply)
         db_add_message(user_id, "user", text)
         db_add_message(user_id, "assistant", reply)
-        if LOG_DIALOG:
-            logger.info("[%s] ClickUp: %s", user_id, reply)
+        logger.info(
+            "[%s] ClickUp: задача создана (срок: %s)",
+            user_id, "да" if draft.get("due_human") else "нет",
+        )
         return True
 
     if answer in _CANCEL_WORDS:
@@ -2727,6 +2738,7 @@ async def _handle_clickup_confirmation(
         await update.message.reply_text(reply)
         db_add_message(user_id, "user", text)
         db_add_message(user_id, "assistant", reply)
+        logger.info("[%s] ClickUp: создание задачи отменено пользователем", user_id)
         return True
 
     # Сообщение не про подтверждение — черновик НЕ трогаем, пусть обрабатывается
@@ -2779,8 +2791,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
     if translate_mode.get(user_id):
-        if LOG_DIALOG:
-            logger.info("[%s] перевод (текст): %s", user_id, text)
+        logger.info("[%s] запрос: перевод текста, %s симв.", user_id, len(text))
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action=ChatAction.TYPING
         )
@@ -2792,8 +2803,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 update.message, user_id, translated, notes, target_lang, base_name=None,
                 force_text=nofile_users.get(user_id, False),
             )
-            if LOG_DIALOG:
-                logger.info("[%s] перевод результат: %s", user_id, translated)
+            logger.info(
+                "[%s] готово: перевод текста, %s симв.", user_id, len(translated)
+            )
         if had_pending_task:
             await _remind_pending_clickup(update, user_id)
         return
@@ -2880,7 +2892,9 @@ async def _transcribe_and_reply(
         )
         return
 
-    logger.info("Расшифровка готова (%s): %r", method_note, (recognized or "")[:200])
+    logger.info(
+        "Расшифровка готова (%s): %s симв.", method_note, len(recognized or "")
+    )
     recognized = (recognized or "").strip()
     if not recognized:
         await fail(
@@ -2892,8 +2906,7 @@ async def _transcribe_and_reply(
     user_id = update.effective_user.id
     # Сырую расшифровку сохраняем (для /raw), но в чат не выводим.
     raw_transcripts[user_id] = recognized
-    if LOG_DIALOG:
-        logger.info("[%s] аудио, сырая расшифровка: %s", user_id, recognized)
+    logger.info("[%s] аудио расшифровано: %s симв.", user_id, len(recognized))
 
     if status is not None:
         await _safe(status.edit_text("✍️ Причёсываю текст…"))
@@ -2911,8 +2924,7 @@ async def _transcribe_and_reply(
 
     result_with_note = f"{result}\n\n— — — — —\n{method_note}"
     await deliver(update.message, result_with_note)
-    if LOG_DIALOG:
-        logger.info("[%s] аудио, результат: %s", user_id, result_with_note)
+    logger.info("[%s] готово: обработка аудио, %s симв.", user_id, len(result))
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
