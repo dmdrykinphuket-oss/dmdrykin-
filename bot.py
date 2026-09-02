@@ -208,7 +208,8 @@ CLICKUP_TOOLS = [
         "description": (
             "Показать задачи ClickUp. Если задан ID пространства — читает задачи "
             "по всему рабочему пространству (все списки), иначе только из списка "
-            "по умолчанию. По умолчанию показывает лишь незакрытые задачи. "
+            "по умолчанию. По умолчанию показывает лишь незакрытые задачи и "
+            "включает подзадачи (с отступом под родительской). "
             "В выводе у каждой задачи указан её список."
         ),
         "input_schema": {
@@ -236,6 +237,15 @@ CLICKUP_TOOLS = [
                         "Фильтр по списку: часть названия списка (без учёта "
                         "регистра) или числовой ID списка. Пусто — все списки "
                         "пространства."
+                    ),
+                },
+                "subtasks": {
+                    "type": "boolean",
+                    "description": (
+                        "Показывать подзадачи (по умолчанию true) — они выводятся "
+                        "с отступом под своей родительской задачей. Поставь false, "
+                        "чтобы получить только верхнеуровневые задачи, когда "
+                        "подзадач слишком много."
                     ),
                 },
             },
@@ -564,6 +574,13 @@ async def _clickup_list_tasks(tool_input: dict) -> str:
     status = (tool_input.get("status") or "").strip().lower()
     due = (tool_input.get("due") or "").strip().lower()
     list_filter = (tool_input.get("list") or "").strip()
+
+    want_subtasks = tool_input.get("subtasks", True)
+    if isinstance(want_subtasks, str):
+        want_subtasks = want_subtasks.strip().lower() not in (
+            "false", "0", "no", "нет", "off", "без", "без подзадач",
+        )
+
     # Обратная совместимость: старый одиночный параметр filter.
     legacy = (tool_input.get("filter") or "").strip().lower()
     if legacy and not status and not due:
@@ -598,6 +615,10 @@ async def _clickup_list_tasks(tool_input: dict) -> str:
             include_closed = True
 
     params.append(("include_closed", "true" if include_closed else "false"))
+    if want_subtasks:
+        params.append(("subtasks", "true"))
+    else:
+        notes.append("без подзадач")
 
     list_id_filter = list_filter if list_filter.isdigit() else ""
     list_name_filter = "" if list_filter.isdigit() else list_filter.lower()
@@ -630,23 +651,92 @@ async def _clickup_list_tasks(tool_input: dict) -> str:
             t for t in tasks
             if list_name_filter in ((t.get("list") or {}).get("name") or "").lower()
         ]
+    if not want_subtasks:
+        tasks = [t for t in tasks if not t.get("parent")]
 
     head = ", ".join([scope_note] + notes)
     if not tasks:
         return f"Задач не найдено ({head})."
+    return await _clickup_format_task_tree(tasks, head)
 
-    lines = [f"Задачи ({head}) — всего {len(tasks)}:"]
-    for t in tasks[:CLICKUP_LIST_LIMIT]:
-        st = (t.get("status") or {}).get("status", "?")
-        due_s = _fmt_ts(t.get("due_date")) if t.get("due_date") else ""
-        due_str = f", срок {due_s}" if due_s else ""
-        list_name = (t.get("list") or {}).get("name") or "?"
-        lines.append(
-            f"• [{t.get('id')}] {t.get('name')} — {st}{due_str} · список: {list_name}"
-        )
-    if len(tasks) > CLICKUP_LIST_LIMIT:
-        lines.append(f"…и ещё {len(tasks) - CLICKUP_LIST_LIMIT} — уточните фильтр.")
-    return "\n".join(lines)
+
+def _clickup_task_line(t: dict) -> str:
+    """Одна задача в человекочитаемом виде (без отступа и маркера)."""
+    st = (t.get("status") or {}).get("status", "?")
+    due_s = _fmt_ts(t.get("due_date")) if t.get("due_date") else ""
+    due_str = f", срок {due_s}" if due_s else ""
+    list_name = (t.get("list") or {}).get("name") or "?"
+    return f"[{t.get('id')}] {t.get('name')} — {st}{due_str} · список: {list_name}"
+
+
+def _clickup_parent_id(t: dict) -> str | None:
+    """ID родительской задачи (у team-эндпоинта поле parent — строка-ID или None)."""
+    pid = t.get("parent")
+    if isinstance(pid, dict):
+        pid = pid.get("id")
+    return pid or None
+
+
+async def _clickup_format_task_tree(tasks: list[dict], head: str) -> str:
+    """Печатает задачи деревом: подзадачи с отступом под своей родительской.
+
+    Подзадача, чья родительская задача не попала в выборку, выводится отдельным
+    блоком с указанием родителя (имя родителя дозапрашиваем по ID)."""
+    by_id = {t.get("id"): t for t in tasks}
+    children: dict[str, list[dict]] = {}
+    roots: list[dict] = []
+    orphans: list[dict] = []
+    for t in tasks:
+        pid = _clickup_parent_id(t)
+        if pid and pid in by_id:
+            children.setdefault(pid, []).append(t)
+        elif pid:
+            orphans.append(t)
+        else:
+            roots.append(t)
+
+    out: list[str] = [f"Задачи ({head}) — всего {len(tasks)}:"]
+    shown = 0
+    truncated = False
+
+    def emit(t: dict, depth: int) -> None:
+        nonlocal shown, truncated
+        if shown >= CLICKUP_LIST_LIMIT:
+            truncated = True
+            return
+        shown += 1
+        indent = "    " * depth
+        marker = "•" if depth == 0 else "↳"
+        out.append(f"{indent}{marker} {_clickup_task_line(t)}")
+        for child in children.get(t.get("id"), []):
+            emit(child, depth + 1)
+
+    for r in roots:
+        emit(r, 0)
+
+    if orphans:
+        # Имена родителей, которых нет в выборке.
+        parent_names: dict[str, str] = {}
+        for pid in list({_clickup_parent_id(t) for t in orphans})[:15]:
+            data, err = await _clickup_request("GET", f"/task/{pid}")
+            if not err and isinstance(data, dict) and data.get("name"):
+                parent_names[pid] = data["name"]
+
+        out.append("")
+        out.append("Подзадачи, родитель которых не в выборке:")
+        for t in orphans:
+            if shown >= CLICKUP_LIST_LIMIT:
+                truncated = True
+                break
+            shown += 1
+            pid = _clickup_parent_id(t)
+            pname = parent_names.get(pid)
+            parent_ref = f" (родитель: [{pid}]{' ' + pname if pname else ''})"
+            out.append(f"    ↳ {_clickup_task_line(t)}{parent_ref}")
+
+    if truncated:
+        out.append(f"…показаны первые {CLICKUP_LIST_LIMIT} — уточните фильтр.")
+    return "\n".join(out)
 
 
 async def _clickup_get_task(tool_input: dict) -> str:
@@ -837,7 +927,8 @@ SYSTEM_PROMPT = (
 CLICKUP_SYSTEM_PROMPT = (
     " У тебя есть инструменты ClickUp: clickup_create_task — подготовить задачу, "
     "clickup_list_tasks — список задач (по всему пространству, если настроено; "
-    "фильтры: статус, срок, список; по умолчанию только незакрытые), "
+    "фильтры: статус, срок, список; по умолчанию только незакрытые, подзадачи "
+    "показываются с отступом под родительской — можно отключить subtasks=false), "
     "clickup_get_task — детали задачи. "
     "Новые задачи создаются только в списке по умолчанию. "
     "Менять и удалять задачи ты не можешь — таких инструментов нет. "
