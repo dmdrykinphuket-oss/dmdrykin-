@@ -51,8 +51,9 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import httpx
 from anthropic import AsyncAnthropic
 import anthropic
 from openai import AsyncOpenAI
@@ -84,6 +85,12 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 # Необязательный: если задан — голосовые расшифровываются через OpenAI Whisper
 # API, если нет — сразу локальной моделью faster-whisper (запасной путь).
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# ClickUp: личный токен и список по умолчанию. Оба необязательные — если чего-то
+# нет, инструменты работы с задачами просто не подключаются (см. .env.example).
+CLICKUP_TOKEN = os.getenv("CLICKUP_TOKEN")
+CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
+CLICKUP_ENABLED = bool(CLICKUP_TOKEN and CLICKUP_LIST_ID)
 
 # Модель Claude, через которую отвечает бот.
 MODEL = "claude-sonnet-5"
@@ -132,6 +139,435 @@ MAX_PAUSE_RESTARTS = 3
 # Сколько раз можно продолжить генерацию, если модель упёрлась в max_tokens
 # посреди ответа — куски потом склеиваются в один ответ (см. _run_conversation).
 MAX_CONTINUATIONS = 5
+
+# Сколько раз подряд модель может вызвать инструменты за один запрос
+# пользователя (защита от зацикливания на вызовах инструментов).
+MAX_TOOL_ROUNDS = 5
+
+# --- ClickUp: задачи через API ----------------------------------------
+# Бот умеет создавать задачи и читать список/детали задач в ClickUp.
+# Обращение к API — заголовок Authorization с личным токеном (CLICKUP_TOKEN),
+# задачи создаются в списке CLICKUP_LIST_ID. Инструментов на удаление и
+# изменение задач НАМЕРЕННО нет — только создание и чтение.
+CLICKUP_API_BASE = "https://api.clickup.com/api/v2"
+
+# Сколько задач максимум показываем в одном списке (чтобы не заваливать чат).
+CLICKUP_LIST_LIMIT = 25
+
+# Сколько ждём подтверждения черновика задачи. Пока идёт это время, любые
+# сообщения кроме явного «нет»/«отмена» обрабатываются как обычно, а черновик
+# сохраняется (с напоминанием). Позже он снимается сам — на первом же
+# следующем сообщении пользователя.
+CLICKUP_CONFIRM_TIMEOUT_SECONDS = 15 * 60
+
+# Описание инструментов для модели. clickup_create_task намеренно НЕ создаёт
+# задачу сразу — он готовит черновик, а создание происходит только после
+# подтверждения пользователя в чате (см. _handle_clickup_confirmation).
+CLICKUP_TOOLS = [
+    {
+        "name": "clickup_create_task",
+        "description": (
+            "Подготовить новую задачу в списке ClickUp по умолчанию. Задача НЕ "
+            "создаётся сразу: инструмент готовит черновик и разбирает срок. "
+            "После вызова покажи пользователю название, описание и срок и дождись "
+            "его явного подтверждения («да»). Создание произойдёт автоматически."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Короткое название задачи.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Описание задачи. Необязательно.",
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": (
+                        "Срок в человеческом виде: «завтра», «до пятницы», "
+                        "«через 3 дня», «15 сентября», «2026-09-20». "
+                        "Оставь пустым, если срок не назван."
+                    ),
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "clickup_list_tasks",
+        "description": (
+            "Показать задачи из списка ClickUp по умолчанию. Можно отфильтровать "
+            "по статусу или по сроку."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "string",
+                    "description": (
+                        "Необязательный фильтр. Либо название статуса "
+                        "(например «open», «in progress», «closed»), либо один "
+                        "из ключей срока: overdue/просроченные, today/сегодня, "
+                        "tomorrow/завтра, week/неделя, no_due/без срока. "
+                        "Пусто — показать все задачи."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "clickup_get_task",
+        "description": "Показать подробности одной задачи ClickUp по её идентификатору.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "ID задачи в ClickUp (например «abc123»).",
+                },
+            },
+            "required": ["task_id"],
+        },
+    },
+]
+
+# Черновики задач, ждущие подтверждения пользователя:
+# {telegram_id: {"name", "description", "due_ms", "due_human"}}
+pending_clickup_tasks: dict[int, dict] = {}
+
+# Ответы «да» / «нет» на шаге подтверждения задачи (сообщение целиком, в нижнем
+# регистре, без завершающих «!» и «.»). Всё, что не попало ни в один набор,
+# считается обычным сообщением — черновик при этом сохраняется.
+_CONFIRM_WORDS = {
+    "да", "ага", "давай", "давай создавай", "давай создай", "создавай", "создай",
+    "ок", "окей", "окэй", "подтверждаю", "подтверждаю создание", "yes", "y",
+    "yep", "go", "го", "+", "верно", "точно", "погнали",
+}
+_CANCEL_WORDS = {
+    "нет", "не надо", "не создавай", "не нужно", "отмена", "отмени", "отменить",
+    "отмени задачу", "стоп", "передумал", "передумала", "no", "cancel",
+}
+
+_RU_WEEKDAYS = {
+    # именительный / винительный / родительный (после «до») / дательный / сокр.
+    "понедельник": 0, "понедельника": 0, "понедельнику": 0, "пн": 0,
+    "вторник": 1, "вторника": 1, "вторнику": 1, "вт": 1,
+    "среда": 2, "среду": 2, "среды": 2, "среде": 2, "ср": 2,
+    "четверг": 3, "четверга": 3, "четвергу": 3, "чт": 3,
+    "пятница": 4, "пятницу": 4, "пятницы": 4, "пятнице": 4, "пт": 4,
+    "суббота": 5, "субботу": 5, "субботы": 5, "субботе": 5, "сб": 5,
+    "воскресенье": 6, "воскресенья": 6, "воскресенью": 6, "вс": 6,
+}
+_RU_MONTHS = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11,
+    "декабря": 12,
+}
+
+
+def parse_human_due_date(raw: str | None) -> tuple[int | None, str | None, str | None]:
+    """Переводит срок из человеческого вида в метку времени ClickUp (мс).
+
+    Возвращает кортеж (timestamp_ms, человекочитаемая_дата, текст_ошибки):
+    - срок разобран  -> (1234.., "2026-09-05", None)
+    - срок не задан   -> (None, None, None)
+    - не смогли понять -> (None, None, "текст ошибки для пользователя")
+
+    Время суток берём 18:00 по времени сервера — ClickUp всё равно показывает
+    задачу как «на весь день» (due_date_time=false).
+    """
+    if not raw or not raw.strip():
+        return None, None, None
+    text = raw.strip().lower()
+    # Длинные предлоги проверяем первыми и выходим после первого совпадения,
+    # иначе «к концу недели» обрежется по «к » до «концу недели».
+    for prefix in (
+        "не позже ", "не позднее ", "к концу ", "before ", "until ", "till ",
+        "до ", "ко ", "во ", "by ", "к ", "в ", "на ",
+    ):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+
+    now = datetime.now()
+    base = now.replace(hour=18, minute=0, second=0, microsecond=0)
+
+    def ok(d: datetime) -> tuple[int, str, None]:
+        return int(d.timestamp() * 1000), d.strftime("%Y-%m-%d"), None
+
+    if text in ("сегодня", "today"):
+        return ok(base)
+    if text in ("завтра", "tomorrow"):
+        return ok(base + timedelta(days=1))
+    if text in ("послезавтра", "day after tomorrow"):
+        return ok(base + timedelta(days=2))
+
+    m = re.match(
+        r"через\s+(\d+)?\s*(календарн\w+\s+)?(день|дня|дней|недел\w+|месяц\w*)", text
+    )
+    if m:
+        n = int(m.group(1)) if m.group(1) else 1
+        unit = m.group(3)
+        if unit.startswith("недел"):
+            days = n * 7
+        elif unit.startswith("месяц"):
+            days = n * 30
+        else:
+            days = n
+        return ok(base + timedelta(days=days))
+
+    # «к концу недели» / «на этой неделе» — считаем сроком ближайшую пятницу.
+    if text in ("недели", "неделе", "конца недели", "конец недели", "концу недели",
+                "этой недели", "этой неделе", "недели этой", "end of week"):
+        text = "пятница"
+
+    if text in _RU_WEEKDAYS:
+        ahead = (_RU_WEEKDAYS[text] - now.weekday()) % 7
+        ahead = ahead or 7  # «до пятницы» в саму пятницу — значит следующая
+        return ok(base + timedelta(days=ahead))
+
+    m = re.match(r"(\d{1,2})\s+([а-яё]+)(?:\s+(\d{4}))?$", text)
+    if m and m.group(2) in _RU_MONTHS:
+        day, month = int(m.group(1)), _RU_MONTHS[m.group(2)]
+        year = int(m.group(3)) if m.group(3) else now.year
+        try:
+            d = base.replace(year=year, month=month, day=day)
+        except ValueError:
+            return None, None, f"Не разобрал дату «{raw}»."
+        if not m.group(3) and d < base:
+            d = d.replace(year=year + 1)
+        return ok(d)
+
+    for pat, order in (
+        (r"(\d{4})-(\d{1,2})-(\d{1,2})", "ymd"),
+        (r"(\d{1,2})\.(\d{1,2})\.(\d{4})", "dmy"),
+        (r"(\d{1,2})\.(\d{1,2})", "dm"),
+    ):
+        m = re.match(pat + r"$", text)
+        if not m:
+            continue
+        try:
+            if order == "ymd":
+                y, mo, da = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            elif order == "dmy":
+                da, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            else:
+                da, mo, y = int(m.group(1)), int(m.group(2)), now.year
+            d = base.replace(year=y, month=mo, day=da)
+        except ValueError:
+            return None, None, f"Не разобрал дату «{raw}»."
+        if order == "dm" and d < base:
+            d = d.replace(year=y + 1)
+        return ok(d)
+
+    return None, None, (
+        f"Не понял срок «{raw}». Скажите иначе: «завтра», «до пятницы», "
+        "«через 3 дня», «15 сентября» или «2026-09-20»."
+    )
+
+
+async def _clickup_request(
+    method: str, path: str, *, params=None, json_body=None
+) -> tuple[dict | list | None, str | None]:
+    """Запрос к ClickUp API. Возвращает (данные, текст_ошибки) — ровно одно из
+    двух не None. Ошибку возвращаем текстом, а не бросаем исключение, чтобы её
+    было видно пользователю (в чате), а не только в логах."""
+    if not CLICKUP_ENABLED:
+        return None, (
+            "ClickUp не настроен: добавьте CLICKUP_TOKEN и CLICKUP_LIST_ID в .env "
+            "(см. .env.example)."
+        )
+    headers = {"Authorization": CLICKUP_TOKEN, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.request(
+                method, f"{CLICKUP_API_BASE}{path}",
+                headers=headers, params=params, json=json_body,
+            )
+    except httpx.HTTPError as e:
+        return None, f"Не удалось связаться с ClickUp API: {e}"
+    if resp.status_code // 100 != 2:
+        return None, f"ClickUp API вернул ошибку {resp.status_code}: {resp.text[:500]}"
+    try:
+        return resp.json(), None
+    except ValueError:
+        return None, f"ClickUp API вернул нечитаемый ответ (код {resp.status_code})."
+
+
+def _fmt_ts(ms) -> str:
+    """Метку времени ClickUp (мс, строка/число) -> «2026-09-05». '' при ошибке."""
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+async def _clickup_prepare_task(user_id: int, tool_input: dict) -> str:
+    """Готовит черновик задачи и запоминает его до подтверждения. Возвращает
+    текст для модели (не для пользователя напрямую)."""
+    name = (tool_input.get("name") or "").strip()
+    if not name:
+        return "Ошибка: у задачи должно быть название."
+    description = (tool_input.get("description") or "").strip()
+    due_ms, due_human, err = parse_human_due_date(tool_input.get("due_date"))
+    if err:
+        return f"Задача НЕ подготовлена — не разобран срок. {err}"
+
+    pending_clickup_tasks[user_id] = {
+        "name": name,
+        "description": description,
+        "due_ms": due_ms,
+        "due_human": due_human,
+        "ts": time.monotonic(),  # для таймаута ожидания подтверждения
+    }
+    lines = [
+        "Черновик задачи готов и ждёт подтверждения пользователя. Задача ещё НЕ создана.",
+        f"Название: {name}",
+    ]
+    if description:
+        lines.append(f"Описание: {description}")
+    lines.append(f"Срок: {due_human}" if due_human else "Срок: не задан")
+    lines.append(
+        "Покажи пользователю эти детали и попроси подтвердить: «да» — создать, "
+        "«нет» — отменить. Другие сообщения не отменяют черновик — он ждёт "
+        "явного ответа."
+    )
+    return "\n".join(lines)
+
+
+async def clickup_create_task_now(draft: dict) -> tuple[str | None, str | None]:
+    """Реально создаёт задачу в списке по умолчанию. Возвращает (url, ошибка)."""
+    body: dict = {"name": draft["name"]}
+    if draft.get("description"):
+        body["description"] = draft["description"]
+    if draft.get("due_ms"):
+        body["due_date"] = draft["due_ms"]
+        body["due_date_time"] = False
+    data, err = await _clickup_request(
+        "POST", f"/list/{CLICKUP_LIST_ID}/task", json_body=body
+    )
+    if err:
+        return None, err
+    url = data.get("url") or (
+        f"https://app.clickup.com/t/{data.get('id')}" if data.get("id") else None
+    )
+    return url, None
+
+
+async def _clickup_list_tasks(tool_input: dict) -> str:
+    """Список задач с необязательным фильтром по статусу или сроку."""
+    filt = (tool_input.get("filter") or "").strip().lower()
+    now = datetime.now()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def ms(d: datetime) -> str:
+        return str(int(d.timestamp() * 1000))
+
+    params: list[tuple[str, str]] = []
+    only_no_due = False
+    note = "все задачи"
+
+    if filt in ("overdue", "просроченные", "просрочено", "просрочка", "просрочены"):
+        params += [("due_date_lt", ms(day_start)), ("include_closed", "false")]
+        note = "просроченные"
+    elif filt in ("today", "сегодня"):
+        params += [("due_date_gt", ms(day_start - timedelta(seconds=1))),
+                   ("due_date_lt", ms(day_start + timedelta(days=1)))]
+        note = "со сроком сегодня"
+    elif filt in ("tomorrow", "завтра"):
+        params += [("due_date_gt", ms(day_start + timedelta(days=1) - timedelta(seconds=1))),
+                   ("due_date_lt", ms(day_start + timedelta(days=2)))]
+        note = "со сроком завтра"
+    elif filt in ("week", "неделя", "на этой неделе", "эта неделя", "неделю"):
+        params += [("due_date_lt", ms(day_start + timedelta(days=7)))]
+        note = "со сроком в ближайшую неделю"
+    elif filt in ("no_due", "без срока", "бессрочные", "no due"):
+        only_no_due = True
+        note = "без срока"
+    elif filt:
+        params.append(("statuses[]", filt))
+        note = f"со статусом «{filt}»"
+
+    data, err = await _clickup_request(
+        "GET", f"/list/{CLICKUP_LIST_ID}/task", params=params or None
+    )
+    if err:
+        return err
+    tasks = data.get("tasks", []) if isinstance(data, dict) else []
+    if only_no_due:
+        tasks = [t for t in tasks if not t.get("due_date")]
+    if not tasks:
+        return f"В списке нет задач ({note})."
+
+    lines = [f"Задачи ({note}) — всего {len(tasks)}:"]
+    for t in tasks[:CLICKUP_LIST_LIMIT]:
+        status = (t.get("status") or {}).get("status", "?")
+        due = _fmt_ts(t.get("due_date")) if t.get("due_date") else ""
+        due_str = f", срок {due}" if due else ""
+        lines.append(f"• [{t.get('id')}] {t.get('name')} — {status}{due_str}")
+    if len(tasks) > CLICKUP_LIST_LIMIT:
+        lines.append(f"…и ещё {len(tasks) - CLICKUP_LIST_LIMIT} — уточните фильтр.")
+    return "\n".join(lines)
+
+
+async def _clickup_get_task(tool_input: dict) -> str:
+    """Подробности одной задачи."""
+    task_id = (tool_input.get("task_id") or "").strip()
+    if not task_id:
+        return "Ошибка: не указан ID задачи."
+    data, err = await _clickup_request("GET", f"/task/{task_id}")
+    if err:
+        return err
+
+    status = (data.get("status") or {}).get("status", "?")
+    lines = [
+        f"Задача [{data.get('id')}]: {data.get('name')}",
+        f"Статус: {status}",
+    ]
+    if data.get("due_date"):
+        lines.append(f"Срок: {_fmt_ts(data.get('due_date')) or '?'}")
+    if data.get("date_created"):
+        lines.append(f"Создана: {_fmt_ts(data.get('date_created')) or '?'}")
+    assignees = ", ".join(
+        a.get("username") or a.get("email") or "?" for a in data.get("assignees", [])
+    )
+    if assignees:
+        lines.append(f"Исполнители: {assignees}")
+    desc = (data.get("text_content") or data.get("description") or "").strip()
+    if desc:
+        lines.append(f"\nОписание:\n{desc[:1500]}")
+    if data.get("url"):
+        lines.append(f"\nСсылка: {data.get('url')}")
+    return "\n".join(lines)
+
+
+async def run_clickup_tool(
+    user_id: int, name: str, tool_input: dict
+) -> tuple[str, bool]:
+    """Выполняет инструмент ClickUp. Возвращает (текст_для_модели, это_ошибка).
+    Признак ошибки прокидываем в tool_result.is_error, а текст ошибки виден
+    модели и попадёт в ответ пользователю — молча ничего не глотаем."""
+    try:
+        if name == "clickup_create_task":
+            return await _clickup_prepare_task(user_id, tool_input), False
+        if name == "clickup_list_tasks":
+            text = await _clickup_list_tasks(tool_input)
+        elif name == "clickup_get_task":
+            text = await _clickup_get_task(tool_input)
+        else:
+            return f"Неизвестный инструмент: {name}", True
+    except Exception as e:  # noqa: BLE001 — покажем текст ошибки, не роняем бот
+        logger.exception("Ошибка инструмента ClickUp %s", name)
+        return f"Внутренняя ошибка инструмента {name}: {e}", True
+
+    is_error = text.startswith((
+        "ClickUp API вернул", "Не удалось связаться с ClickUp",
+        "ClickUp не настроен", "Ошибка:",
+    ))
+    return text, is_error
+
 
 # --- Документы ----------------------------------------------------------
 # Какие форматы принимаем.
@@ -255,6 +691,22 @@ SYSTEM_PROMPT = (
     "Если пользователь прислал изображение — рассмотри его и отвечай по нему; "
     "когда к фото есть подпись — это и есть вопрос или задача по картинке."
 )
+
+# Добавка к системному промпту, когда подключён ClickUp.
+CLICKUP_SYSTEM_PROMPT = (
+    " У тебя есть инструменты ClickUp: clickup_create_task — подготовить задачу, "
+    "clickup_list_tasks — список задач, clickup_get_task — детали задачи. "
+    "Менять и удалять задачи ты не можешь — таких инструментов нет. "
+    "clickup_create_task НЕ создаёт задачу сразу: он готовит черновик. "
+    "После вызова покажи пользователю название, описание и срок задачи и дождись "
+    "явного «да» — тогда задача создастся сама и в чат придёт ссылка на неё. "
+    "Явное «нет» отменяет черновик; на прочие сообщения отвечай как обычно — "
+    "черновик сохраняется и ждёт ответа. "
+    "Если инструмент вернул ошибку — покажи её пользователю текстом, не замалчивай."
+)
+
+if CLICKUP_ENABLED:
+    SYSTEM_PROMPT += CLICKUP_SYSTEM_PROMPT
 
 
 def parse_allowed_users(raw: str | None) -> set[int]:
@@ -1418,7 +1870,9 @@ GENERATION_TIMEOUT_SECONDS = 600
 STATUS_UPDATE_INTERVAL = 3.0
 
 
-async def _stream_create(messages: list[dict], use_web_search: bool, on_progress=None):
+async def _stream_create(
+    messages: list[dict], use_web_search: bool, on_progress=None, tools=None
+):
     """Запрос к модели в потоковом режиме (streaming) — ответ собирается по
     кусочкам, а не ожидается одним блоком целиком. По ходу (не чаще, чем раз в
     STATUS_UPDATE_INTERVAL) зовёт on_progress(накопленный_текст). Возвращает
@@ -1429,8 +1883,11 @@ async def _stream_create(messages: list[dict], use_web_search: bool, on_progress
         system=SYSTEM_PROMPT,
         messages=messages,
     )
+    tool_list = list(tools) if tools else []
     if use_web_search:
-        kwargs["tools"] = [WEB_SEARCH_TOOL]
+        tool_list.append(WEB_SEARCH_TOOL)
+    if tool_list:
+        kwargs["tools"] = tool_list
 
     text_parts: list[str] = []
     last_update = 0.0
@@ -1460,9 +1917,11 @@ def _responses_text(responses: list) -> str:
 
 async def _run_conversation(
     history: list[dict], use_web_search: bool, document: dict | None,
-    image_list: list[dict] | None = None, on_progress=None
+    image_list: list[dict] | None = None, on_progress=None, user_id: int | None = None
 ) -> list:
     """Запрос к модели (потоково). Возвращает список Message по цепочке:
+    - если модель вызвала инструмент (ClickUp) — выполняем и продолжаем,
+      до MAX_TOOL_ROUNDS раз;
     - если ответ «встал на паузу» посреди поиска (pause_turn) — продолжаем;
     - если упёрлись в max_tokens посреди ответа — тоже продолжаем (явной
       просьбой «продолжи»), до MAX_CONTINUATIONS раз; куски склеивает
@@ -1470,19 +1929,58 @@ async def _run_conversation(
     messages = _build_messages(history, document, image_list)
     responses: list = []
 
+    # Инструменты ClickUp даём модели, только если ClickUp настроен и известно,
+    # от чьего имени работаем (нужно для черновика задачи «до подтверждения»).
+    clickup_tools = CLICKUP_TOOLS if (CLICKUP_ENABLED and user_id is not None) else None
+
     async def progress_wrapper(chunk_text: str) -> None:
         if on_progress:
             await on_progress(_responses_text(responses) + chunk_text)
 
-    response = await _stream_create(messages, use_web_search, progress_wrapper)
+    response = await _stream_create(
+        messages, use_web_search, progress_wrapper, tools=clickup_tools
+    )
     responses.append(response)
 
     pause_restarts = 0
     continuations = 0
+    tool_rounds = 0
     while True:
+        if (
+            response.stop_reason == "tool_use"
+            and clickup_tools
+            and tool_rounds < MAX_TOOL_ROUNDS
+        ):
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                result_text, is_error = await run_clickup_tool(
+                    user_id, block.name, dict(block.input or {})
+                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                    "is_error": is_error,
+                })
+            if not tool_results:  # tool_use без клиентских инструментов — просто выходим
+                break
+            messages = messages + [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": tool_results},
+            ]
+            response = await _stream_create(
+                messages, use_web_search, progress_wrapper, tools=clickup_tools
+            )
+            responses.append(response)
+            tool_rounds += 1
+            continue
         if response.stop_reason == "pause_turn" and pause_restarts < MAX_PAUSE_RESTARTS:
             messages = messages + [{"role": "assistant", "content": response.content}]
-            response = await _stream_create(messages, use_web_search, progress_wrapper)
+            response = await _stream_create(
+                messages, use_web_search, progress_wrapper, tools=clickup_tools
+            )
             responses.append(response)
             pause_restarts += 1
             continue
@@ -1494,7 +1992,9 @@ async def _run_conversation(
                     "без вступлений, извинений и повторов уже написанного."
                 )},
             ]
-            response = await _stream_create(messages, use_web_search, progress_wrapper)
+            response = await _stream_create(
+                messages, use_web_search, progress_wrapper, tools=clickup_tools
+            )
             responses.append(response)
             continuations += 1
             continue
@@ -1565,7 +2065,7 @@ def _extract_answer(responses: list) -> str:
 
 async def ask_claude(
     history: list[dict], document: dict | None = None,
-    image_list: list[dict] | None = None, on_progress=None
+    image_list: list[dict] | None = None, on_progress=None, user_id: int | None = None
 ):
     """Отправляет историю (и документ / изображения, если есть) в Claude — потоково, с
     ограничением по времени (GENERATION_TIMEOUT_SECONDS).
@@ -1579,14 +2079,16 @@ async def ask_claude(
     try:
         responses = await asyncio.wait_for(
             _run_conversation(history, use_web_search=True, document=document,
-                              image_list=image_list, on_progress=on_progress),
+                              image_list=image_list, on_progress=on_progress,
+                              user_id=user_id),
             timeout=GENERATION_TIMEOUT_SECONDS,
         )
     except anthropic.BadRequestError:
         logger.warning("Веб-поиск недоступен — отвечаю без него", exc_info=True)
         responses = await asyncio.wait_for(
             _run_conversation(history, use_web_search=False, document=document,
-                              image_list=image_list, on_progress=on_progress),
+                              image_list=image_list, on_progress=on_progress,
+                              user_id=user_id),
             timeout=GENERATION_TIMEOUT_SECONDS,
         )
     return _extract_answer(responses), responses
@@ -1610,6 +2112,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "можно задавать вопросы подряд; альбом обрабатываю целиком;\n"
         "• запишите голосовое или пришлите аудиофайл — я расшифрую его, "
         "причешу текст и (если запись длинная) сделаю краткое резюме;\n"
+        "• попросите завести задачу в ClickUp («поставь задачу … до пятницы») — "
+        "покажу черновик, а создам только после вашего «да» и пришлю ссылку; "
+        "могу и показать задачи из списка;\n"
         "• /tr — включить режим перевода: сообщения и документы переводятся "
         "вместо обсуждения, направление — по языку текста; /tr off — выключить;\n"
         "• длинный ответ (> 3000 символов) приходит файлом .docx, короткий — "
@@ -2083,7 +2588,7 @@ async def get_model_answer(
 
     try:
         answer, responses = await ask_claude(
-            history, document, image_list, on_progress=progress
+            history, document, image_list, on_progress=progress, user_id=user_id
         )
     except (asyncio.TimeoutError, TimeoutError):
         logger.warning("Генерация превысила таймаут (%s с)", GENERATION_TIMEOUT_SECONDS)
@@ -2154,6 +2659,104 @@ async def get_model_answer(
     return answer
 
 
+def _clickup_draft_expired(draft: dict) -> bool:
+    """Черновик задачи провисел без ответа дольше таймаута?"""
+    return time.monotonic() - draft.get("ts", 0.0) > CLICKUP_CONFIRM_TIMEOUT_SECONDS
+
+
+async def _handle_clickup_confirmation(
+    update: Update, user_id: int, text: str
+) -> bool:
+    """Реакция на сообщение, пока висит черновик задачи ClickUp.
+
+    Возвращает True, только если сообщение полностью обработано здесь — то есть
+    это было явное «да» (задача создана / ошибка при создании) или явное «нет»
+    (черновик отменён). Во всех остальных случаях возвращает False, и сообщение
+    идёт в обычную обработку:
+      • черновик просрочен  → снимаем его и предупреждаем пользователя;
+      • сообщение не про подтверждение → черновик СОХРАНЯЕМ (напоминание о нём
+        добавит _remind_pending_clickup уже после обычного ответа).
+    """
+    draft = pending_clickup_tasks.get(user_id)
+    if not draft:
+        return False
+
+    if _clickup_draft_expired(draft):
+        pending_clickup_tasks.pop(user_id, None)
+        note = (
+            f"⌛ Черновик задачи «{draft['name']}» не подтверждён за "
+            f"{CLICKUP_CONFIRM_TIMEOUT_SECONDS // 60} мин — снял его. "
+            "Если задача ещё нужна, попросите создать заново."
+        )
+        await update.message.reply_text(note)
+        db_add_message(user_id, "assistant", note)
+        return False
+
+    answer = (text or "").strip().lower().rstrip("!.")
+
+    if answer in _CONFIRM_WORDS:
+        await context_typing(update)
+        url, err = await clickup_create_task_now(draft)
+        if err:
+            # Черновик оставляем и продлеваем окно — можно повторить «да».
+            draft["ts"] = time.monotonic()
+            reply = f"❌ Задача не создана. {err}\nНапишите «да», чтобы повторить."
+            await update.message.reply_text(reply)
+            db_add_message(user_id, "user", text)
+            db_add_message(user_id, "assistant", reply)
+            if LOG_DIALOG:
+                logger.info("[%s] ClickUp: %s", user_id, reply)
+            return True
+        pending_clickup_tasks.pop(user_id, None)
+        reply = f"✅ Задача создана: {draft['name']}"
+        if draft.get("due_human"):
+            reply += f"\n🗓 Срок: {draft['due_human']}"
+        reply += f"\n🔗 {url}" if url else (
+            "\n(ссылку ClickUp не вернул — задача в списке по умолчанию)"
+        )
+        await update.message.reply_text(reply)
+        db_add_message(user_id, "user", text)
+        db_add_message(user_id, "assistant", reply)
+        if LOG_DIALOG:
+            logger.info("[%s] ClickUp: %s", user_id, reply)
+        return True
+
+    if answer in _CANCEL_WORDS:
+        pending_clickup_tasks.pop(user_id, None)
+        reply = "Понял, задачу не создаю."
+        await update.message.reply_text(reply)
+        db_add_message(user_id, "user", text)
+        db_add_message(user_id, "assistant", reply)
+        return True
+
+    # Сообщение не про подтверждение — черновик НЕ трогаем, пусть обрабатывается
+    # обычным путём; напоминание о висящем черновике добавится после ответа.
+    return False
+
+
+async def _remind_pending_clickup(update: Update, user_id: int) -> None:
+    """Если после обычного ответа черновик задачи всё ещё ждёт подтверждения —
+    коротко напоминаем об этом (по таймауту он снимется на следующем сообщении)."""
+    draft = pending_clickup_tasks.get(user_id)
+    if not draft or _clickup_draft_expired(draft):
+        return
+    reminder = (
+        f"↩️ Черновик задачи «{draft['name']}» ещё ждёт подтверждения: "
+        "«да» — создать, «нет» — отменить."
+    )
+    await _safe(update.message.reply_text(reminder))
+
+
+async def context_typing(update: Update) -> None:
+    """Показать статус «печатает…» (косметика, сбой не критичен)."""
+    try:
+        await update.get_bot().send_chat_action(
+            chat_id=update.effective_chat.id, action=ChatAction.TYPING
+        )
+    except Exception:
+        logger.debug("Не удалось отправить chat action", exc_info=True)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         await update.message.reply_text(DENY_TEXT)
@@ -2166,6 +2769,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     user_id = update.effective_user.id
     text = update.message.text
+
+    # Висит черновик задачи ClickUp? Явное «да»/«нет» обрабатываем здесь и
+    # выходим. Всё прочее (в т.ч. просрочку черновика) пропускаем дальше в
+    # обычную обработку, а в конце напоминаем про несозданную задачу.
+    had_pending_task = user_id in pending_clickup_tasks
+    if had_pending_task:
+        if await _handle_clickup_confirmation(update, user_id, text):
+            return
 
     if translate_mode.get(user_id):
         if LOG_DIALOG:
@@ -2183,10 +2794,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             if LOG_DIALOG:
                 logger.info("[%s] перевод результат: %s", user_id, translated)
+        if had_pending_task:
+            await _remind_pending_clickup(update, user_id)
         return
 
     # Доставка (текстом или файлом) уже выполнена внутри get_model_answer.
     await get_model_answer(update, context, user_id, text)
+    if had_pending_task:
+        await _remind_pending_clickup(update, user_id)
 
 
 async def _transcribe_and_reply(
@@ -2350,6 +2965,13 @@ def main() -> None:
         "История: %s сообщений от %s пользователей (%s)",
         stats["n"], stats["u"], DB_PATH,
     )
+
+    if CLICKUP_ENABLED:
+        logger.info("ClickUp подключён: задачи создаются в списке %s", CLICKUP_LIST_ID)
+    else:
+        logger.info(
+            "ClickUp выключен: не заданы CLICKUP_TOKEN и/или CLICKUP_LIST_ID в .env"
+        )
 
     # Таймауты побольше — сеть на этой машине бывает нестабильной.
     # concurrent_updates — сообщения обрабатываются параллельно: один тяжёлый
