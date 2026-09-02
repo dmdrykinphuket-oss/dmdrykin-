@@ -43,6 +43,10 @@
 
 import asyncio
 import base64
+import email
+import email.header
+import email.utils
+import imaplib
 import io
 import json
 import logging
@@ -95,6 +99,15 @@ CLICKUP_LIST_ID = os.getenv("CLICKUP_LIST_ID")
 # если не задан, список задач ограничивается CLICKUP_LIST_ID.
 CLICKUP_TEAM_ID = os.getenv("CLICKUP_TEAM_ID")
 CLICKUP_ENABLED = bool(CLICKUP_TOKEN and CLICKUP_LIST_ID)
+
+# Почта Яндекса (только чтение по IMAP). Обе переменные необязательные — если
+# любой нет, инструмент поиска писем не подключается (см. .env.example).
+# Пароль — лучше отдельный «пароль приложения» из настроек Яндекс ID.
+YANDEX_MAIL_USER = os.getenv("YANDEX_MAIL_USER")
+YANDEX_MAIL_PASSWORD = os.getenv("YANDEX_MAIL_PASSWORD")
+YANDEX_MAIL_ENABLED = bool(YANDEX_MAIL_USER and YANDEX_MAIL_PASSWORD)
+YANDEX_IMAP_HOST = "imap.yandex.ru"
+YANDEX_IMAP_PORT = 993
 
 # Модель Claude, через которую отвечает бот.
 MODEL = "claude-sonnet-5"
@@ -799,6 +812,219 @@ async def run_clickup_tool(
     return text, is_error
 
 
+# --- Почта Яндекса: чтение по IMAP -----------------------------------
+# Один инструмент — поиск писем. Возвращаются ТОЛЬКО метаданные: отправитель,
+# тема, дата, имена вложений. Тела писем не запрашиваются и не читаются.
+# Отправки/удаления/изменения нет намеренно. Соединение с imap.yandex.ru
+# открывается на время запроса и закрывается сразу после (не держим открытым).
+
+YANDEX_MAIL_DEFAULT_DAYS = 7      # период по умолчанию
+YANDEX_MAIL_MAX_DAYS = 90         # дальше в прошлое не смотрим
+YANDEX_MAIL_MAX_RESULTS = 30      # столько писем максимум отдаём модели
+YANDEX_MAIL_SCAN_LIMIT = 300      # столько самых свежих писем за период разбираем
+YANDEX_MAIL_TIMEOUT = 20          # сек. на сетевые операции IMAP
+
+YANDEX_MAIL_TOOLS = [
+    {
+        "name": "yandex_mail_search",
+        "description": (
+            "Найти письма в почте Яндекса (папка «Входящие») за последние N дней. "
+            "Для каждого письма возвращает отправителя, тему, дату и имена "
+            "вложений. Тела писем инструмент не читает — только заголовки. "
+            "Отправка, удаление и изменение писем не поддерживаются."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Слово или фраза для поиска в теме письма или адресе/"
+                        "имени отправителя (без учёта регистра). Пусто — все "
+                        "письма за период."
+                    ),
+                },
+                "days": {
+                    "type": "integer",
+                    "description": (
+                        f"За сколько последних дней смотреть. По умолчанию "
+                        f"{YANDEX_MAIL_DEFAULT_DAYS}, максимум {YANDEX_MAIL_MAX_DAYS}."
+                    ),
+                },
+            },
+        },
+    },
+]
+
+
+def _decode_mime_header(raw: str | None) -> str:
+    """Раскодирует MIME-заголовок (=?UTF-8?B?…?=, =?windows-1251?Q?…?= и т.п.)
+    в обычную строку. Такие заголовки — норма для русской почты."""
+    if not raw:
+        return ""
+    try:
+        parts = email.header.decode_header(raw)
+        out = []
+        for chunk, enc in parts:
+            if isinstance(chunk, bytes):
+                out.append(chunk.decode(enc or "utf-8", errors="replace"))
+            else:
+                out.append(chunk)
+        return "".join(out).strip()
+    except Exception:
+        return raw.strip()
+
+
+def _format_mail_date(raw: str | None) -> str:
+    if not raw:
+        return "?"
+    try:
+        return email.utils.parsedate_to_datetime(raw).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return raw
+
+
+def _attachment_names(bodystructure: str) -> list[str]:
+    """Имена вложений из строки BODYSTRUCTURE — только по параметрам name/filename,
+    без загрузки самих частей письма. Значения тоже бывают MIME-кодированы."""
+    names: list[str] = []
+    for raw in re.findall(
+        r'"(?:name|filename)"\s+"((?:[^"\\]|\\.)*)"', bodystructure, re.I
+    ):
+        name = _decode_mime_header(raw.replace('\\"', '"').replace("\\\\", "\\"))
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _yandex_mail_search_blocking(query: str, days: int) -> tuple[dict | None, str | None]:
+    """Синхронный поиск по IMAP (запускается в отдельном потоке).
+
+    Возвращает (результат, текст_ошибки). Соединение открывается и ГАРАНТИРОВАННО
+    закрывается здесь же — наружу оно не живёт. Тела писем не запрашиваются:
+    берём только HEADER и BODYSTRUCTURE.
+    """
+    since = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+    q = (query or "").strip().lower()
+    conn = None
+    try:
+        conn = imaplib.IMAP4_SSL(
+            YANDEX_IMAP_HOST, YANDEX_IMAP_PORT, timeout=YANDEX_MAIL_TIMEOUT
+        )
+        conn.login(YANDEX_MAIL_USER, YANDEX_MAIL_PASSWORD)
+        conn.select("INBOX", readonly=True)
+
+        typ, data = conn.search(None, "SINCE", since)
+        if typ != "OK":
+            return None, f"Почта Яндекса: поиск не удался ({typ})."
+        ids = data[0].split()
+        scanned = ids[-YANDEX_MAIL_SCAN_LIMIT:]
+
+        results: list[dict] = []
+        for mid in reversed(scanned):  # свежие сверху
+            mid_s = mid.decode() if isinstance(mid, (bytes, bytearray)) else str(mid)
+            typ, fetched = conn.fetch(mid_s, "(BODY.PEEK[HEADER] BODYSTRUCTURE)")
+            if typ != "OK" or not fetched:
+                continue
+            header_bytes = b""
+            struct = ""
+            for part in fetched:
+                if isinstance(part, tuple):
+                    if part[0]:
+                        struct += part[0].decode("latin-1", "replace")
+                    header_bytes += part[1] or b""
+                elif isinstance(part, (bytes, bytearray)):
+                    struct += bytes(part).decode("latin-1", "replace")
+            msg = email.message_from_bytes(header_bytes)
+            subject = _decode_mime_header(msg.get("Subject")) or "(без темы)"
+            sender = _decode_mime_header(msg.get("From")) or "(отправитель неизвестен)"
+            if q and q not in subject.lower() and q not in sender.lower():
+                continue
+            results.append({
+                "from": sender,
+                "subject": subject,
+                "date": _format_mail_date(msg.get("Date")),
+                "attachments": _attachment_names(struct),
+            })
+            if len(results) >= YANDEX_MAIL_MAX_RESULTS:
+                break
+
+        return (
+            {"messages": results, "window_total": len(ids), "scanned": len(scanned)},
+            None,
+        )
+    except imaplib.IMAP4.error as e:
+        return None, f"Почта Яндекса: ошибка входа или IMAP ({e})."
+    except Exception as e:  # noqa: BLE001 — сеть/SSL/таймаут: покажем текстом
+        return None, f"Почта Яндекса: не удалось выполнить запрос ({e})."
+    finally:
+        if conn is not None:
+            try:
+                conn.logout()  # закрывает и папку, и соединение
+            except Exception:
+                pass
+
+
+async def _yandex_mail_search(user_id: int | None, tool_input: dict) -> str:
+    query = (tool_input.get("query") or "").strip()
+    raw_days = tool_input.get("days")
+    try:
+        days = int(raw_days) if raw_days is not None else YANDEX_MAIL_DEFAULT_DAYS
+    except (TypeError, ValueError):
+        days = YANDEX_MAIL_DEFAULT_DAYS
+    days = max(1, min(days, YANDEX_MAIL_MAX_DAYS))
+
+    result, err = await asyncio.to_thread(_yandex_mail_search_blocking, query, days)
+    if err:
+        logger.warning("[%s] почта Яндекса: %s", user_id, err)
+        return err
+
+    msgs = result["messages"]
+    logger.info(
+        "[%s] почта Яндекса: найдено %s писем за %s дн.", user_id, len(msgs), days
+    )
+    scope = f"за {days} дн." + (f", запрос «{query}»" if query else "")
+    if not msgs:
+        return f"Писем не найдено ({scope})."
+
+    lines = [f"Найдено писем: {len(msgs)} ({scope})", ""]
+    for m in msgs:
+        lines.append(f"• {m['date']} — от {m['from']}")
+        lines.append(f"  тема: {m['subject']}")
+        if m["attachments"]:
+            lines.append(f"  вложения: {', '.join(m['attachments'])}")
+    if result["window_total"] > result["scanned"]:
+        lines.append("")
+        lines.append(
+            f"(разобраны {result['scanned']} самых свежих писем из "
+            f"{result['window_total']} за период — сузьте период или запрос)"
+        )
+    return "\n".join(lines)
+
+
+async def run_yandex_mail_tool(
+    user_id: int | None, name: str, tool_input: dict
+) -> tuple[str, bool]:
+    """Выполняет инструмент почты Яндекса. Возвращает (текст_для_модели, ошибка)."""
+    if name != "yandex_mail_search":
+        return f"Неизвестный инструмент: {name}", True
+    try:
+        text = await _yandex_mail_search(user_id, tool_input)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Ошибка инструмента почты Яндекса")
+        return f"Внутренняя ошибка инструмента {name}: {e}", True
+    return text, text.startswith("Почта Яндекса:")
+
+
+async def run_client_tool(
+    user_id: int | None, name: str, tool_input: dict
+) -> tuple[str, bool]:
+    """Диспетчер клиентских инструментов (ClickUp, почта Яндекса)."""
+    if name.startswith("yandex_mail_"):
+        return await run_yandex_mail_tool(user_id, name, tool_input)
+    return await run_clickup_tool(user_id, name, tool_input)
+
+
 # --- Документы ----------------------------------------------------------
 # Какие форматы принимаем.
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt"}
@@ -942,6 +1168,18 @@ CLICKUP_SYSTEM_PROMPT = (
 
 if CLICKUP_ENABLED:
     SYSTEM_PROMPT += CLICKUP_SYSTEM_PROMPT
+
+# Добавка к системному промпту, когда подключена почта Яндекса.
+YANDEX_MAIL_SYSTEM_PROMPT = (
+    " У тебя есть инструмент yandex_mail_search — поиск писем в почте Яндекса "
+    "за последние N дней. Он возвращает только отправителя, тему, дату и имена "
+    "вложений; тела писем не читаются. Отправлять, удалять и менять письма "
+    "нельзя — таких инструментов нет. Если инструмент вернул ошибку — покажи её "
+    "пользователю текстом."
+)
+
+if YANDEX_MAIL_ENABLED:
+    SYSTEM_PROMPT += YANDEX_MAIL_SYSTEM_PROMPT
 
 
 def parse_allowed_users(raw: str | None) -> set[int]:
@@ -2182,8 +2420,8 @@ async def _run_conversation(
     image_list: list[dict] | None = None, on_progress=None, user_id: int | None = None
 ) -> list:
     """Запрос к модели (потоково). Возвращает список Message по цепочке:
-    - если модель вызвала инструмент (ClickUp) — выполняем и продолжаем,
-      до MAX_TOOL_ROUNDS раз;
+    - если модель вызвала инструмент (ClickUp, почта Яндекса) — выполняем и
+      продолжаем, до MAX_TOOL_ROUNDS раз;
     - если ответ «встал на паузу» посреди поиска (pause_turn) — продолжаем;
     - если упёрлись в max_tokens посреди ответа — тоже продолжаем (явной
       просьбой «продолжи»), до MAX_CONTINUATIONS раз; куски склеивает
@@ -2191,16 +2429,21 @@ async def _run_conversation(
     messages = _build_messages(history, document, image_list)
     responses: list = []
 
-    # Инструменты ClickUp даём модели, только если ClickUp настроен и известно,
-    # от чьего имени работаем (нужно для черновика задачи «до подтверждения»).
-    clickup_tools = CLICKUP_TOOLS if (CLICKUP_ENABLED and user_id is not None) else None
+    # Клиентские инструменты: ClickUp (нужен user_id — для черновика задачи
+    # «до подтверждения») и поиск по почте Яндекса. Пустой список -> None.
+    client_tools: list = []
+    if CLICKUP_ENABLED and user_id is not None:
+        client_tools += CLICKUP_TOOLS
+    if YANDEX_MAIL_ENABLED:
+        client_tools += YANDEX_MAIL_TOOLS
+    client_tools = client_tools or None
 
     async def progress_wrapper(chunk_text: str) -> None:
         if on_progress:
             await on_progress(_responses_text(responses) + chunk_text)
 
     response = await _stream_create(
-        messages, use_web_search, progress_wrapper, tools=clickup_tools
+        messages, use_web_search, progress_wrapper, tools=client_tools
     )
     responses.append(response)
 
@@ -2210,14 +2453,14 @@ async def _run_conversation(
     while True:
         if (
             response.stop_reason == "tool_use"
-            and clickup_tools
+            and client_tools
             and tool_rounds < MAX_TOOL_ROUNDS
         ):
             tool_results = []
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                result_text, is_error = await run_clickup_tool(
+                result_text, is_error = await run_client_tool(
                     user_id, block.name, dict(block.input or {})
                 )
                 tool_results.append({
@@ -2233,7 +2476,7 @@ async def _run_conversation(
                 {"role": "user", "content": tool_results},
             ]
             response = await _stream_create(
-                messages, use_web_search, progress_wrapper, tools=clickup_tools
+                messages, use_web_search, progress_wrapper, tools=client_tools
             )
             responses.append(response)
             tool_rounds += 1
@@ -2241,7 +2484,7 @@ async def _run_conversation(
         if response.stop_reason == "pause_turn" and pause_restarts < MAX_PAUSE_RESTARTS:
             messages = messages + [{"role": "assistant", "content": response.content}]
             response = await _stream_create(
-                messages, use_web_search, progress_wrapper, tools=clickup_tools
+                messages, use_web_search, progress_wrapper, tools=client_tools
             )
             responses.append(response)
             pause_restarts += 1
@@ -2255,7 +2498,7 @@ async def _run_conversation(
                 )},
             ]
             response = await _stream_create(
-                messages, use_web_search, progress_wrapper, tools=clickup_tools
+                messages, use_web_search, progress_wrapper, tools=client_tools
             )
             responses.append(response)
             continuations += 1
@@ -3277,6 +3520,13 @@ def main() -> None:
     else:
         logger.info(
             "ClickUp выключен: не заданы CLICKUP_TOKEN и/или CLICKUP_LIST_ID в .env"
+        )
+
+    if YANDEX_MAIL_ENABLED:
+        logger.info("Почта Яндекса подключена (IMAP, только чтение)")
+    else:
+        logger.info(
+            "Почта Яндекса выключена: не заданы YANDEX_MAIL_USER/YANDEX_MAIL_PASSWORD"
         )
 
     # Таймауты побольше — сеть на этой машине бывает нестабильной.
