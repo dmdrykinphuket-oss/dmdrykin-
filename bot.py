@@ -1368,32 +1368,55 @@ _CLEAN_SCHEMA = {
                 "Задачи и поручения из текста. Пустой массив, если их нет."
             ),
         },
+        "intent": {
+            "type": "string",
+            "enum": ["note", "request"],
+            "description": (
+                "request — говорящий обращается к ассистенту и просит его что-то "
+                "сделать: поставить/создать задачу, показать список задач, найти "
+                "задачу, напомнить, перевести и т.п. "
+                "note — всё остальное: мысль, заметка, надиктовка текста, запись "
+                "разговора или совещания. Если обращения к ассистенту нет — это "
+                "note, даже когда в записи проговариваются дела и поручения "
+                "между людьми."
+            ),
+        },
     },
-    "required": ["cleaned", "gist", "key_points", "agreements", "tasks"],
+    "required": ["cleaned", "gist", "key_points", "agreements", "tasks", "intent"],
     "additionalProperties": False,
 }
 
 
-async def process_transcript(raw: str, user_id: int) -> str:
-    """Причёсывает расшифровку через модель и возвращает готовый текст для чата.
+async def process_transcript(raw: str, user_id: int) -> tuple[str, str, str]:
+    """Причёсывает расшифровку через модель.
 
-    Если raw длиннее TRANSCRIPT_SUMMARY_THRESHOLD — добавляет структурное резюме.
+    Возвращает (cleaned, summary_block, intent):
+    - cleaned — вычищенный текст;
+    - summary_block — блок резюме с ведущим разделителем «— — — — —» или "";
+    - intent — "note" или "request" (см. _CLEAN_SCHEMA).
+
+    Если raw длиннее TRANSCRIPT_SUMMARY_THRESHOLD — заполняется резюме.
     Бросает исключение, если модель недоступна (вызывающий покажет сырой текст).
     """
     need_summary = len(raw) > TRANSCRIPT_SUMMARY_THRESHOLD
 
+    intent_help = (
+        " Ещё определи intent: 'request', если говорящий обращается к ассистенту "
+        "и просит его что-то сделать (поставить/создать задачу, показать задачи, "
+        "напомнить, перевести…); иначе 'note'."
+    )
     if need_summary:
         task = (
             "Запись длинная — помимо cleaned заполни резюме по её содержанию: "
             "gist (суть одной строкой), key_points (ключевые пункты), "
             "agreements (договорённости) и tasks (задачи). "
             "Блок оставляй пустым, если в тексте этого нет."
-        )
+        ) + intent_help
     else:
         task = (
             "Запись короткая — резюме не нужно: gist оставь пустой строкой, "
             "key_points, agreements и tasks — пустыми массивами."
-        )
+        ) + intent_help
 
     response = await claude.messages.create(
         model=MODEL,
@@ -1418,7 +1441,11 @@ async def process_transcript(raw: str, user_id: int) -> str:
     if not cleaned:
         raise ValueError("модель вернула пустой cleaned")
 
-    parts = [cleaned]
+    intent = data.get("intent")
+    if intent not in ("note", "request"):
+        intent = "note"
+
+    summary_block = ""
     if need_summary:
         blocks = []
         gist = (data.get("gist") or "").strip()
@@ -1439,9 +1466,9 @@ async def process_transcript(raw: str, user_id: int) -> str:
                 "✅ Задачи:\n" + "\n".join(f"• {t}" for t in data["tasks"])
             )
         if blocks:
-            parts.append("— — — — —\n" + "\n\n".join(blocks))
+            summary_block = "— — — — —\n" + "\n\n".join(blocks)
 
-    return "\n\n".join(parts)
+    return cleaned, summary_block, intent
 
 
 # --- Режим перевода (/tr) ------------------------------------------------
@@ -2345,8 +2372,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• пришлите картинку (фото или файлом jpg/png/webp) — с подписью отвечу "
         "на неё, без подписи просто прокомментирую; фото остаётся в контексте, "
         "можно задавать вопросы подряд; альбом обрабатываю целиком;\n"
-        "• запишите голосовое или пришлите аудиофайл — я расшифрую его, "
-        "причешу текст и (если запись длинная) сделаю краткое резюме;\n"
+        "• запишите голосовое или пришлите аудиофайл — я расшифрую его и "
+        "причешу текст; если это заметка или запись разговора — сделаю резюме "
+        "(для длинной записи), а если поручение («поставь задачу…») — выполню "
+        "его так же, как напечатанное сообщение;\n"
         "• попросите завести задачу в ClickUp («поставь задачу … до пятницы») — "
         "покажу черновик, а создам только после вашего «да» и пришлю ссылку; "
         "могу и показать задачи из списка;\n"
@@ -3007,8 +3036,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user_id = update.effective_user.id
-    text = update.message.text
+    await _handle_user_text(update, context, user_id, update.message.text)
 
+
+async def _handle_user_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str
+) -> None:
+    """Единый путь для текстового хода пользователя — что напечатано руками, что
+    надиктовано голосом (см. _transcribe_and_reply). Проходит через:
+    подтверждение черновика ClickUp → режим перевода → get_model_answer (с его
+    циклом вызова инструментов) → напоминание о висящем черновике."""
     # Висит черновик задачи ClickUp? Явное «да»/«нет» обрабатываем здесь и
     # выходим. Всё прочее (в т.ч. просрочку черновика) пропускаем дальше в
     # обычную обработку, а в конце напоминаем про несозданную задачу.
@@ -3138,20 +3175,42 @@ async def _transcribe_and_reply(
     if status is not None:
         await _safe(status.edit_text("✍️ Причёсываю текст…"))
     try:
-        result = await process_transcript(recognized[:MAX_TRANSCRIPT_CHARS], user_id)
+        cleaned, summary_block, intent = await process_transcript(
+            recognized[:MAX_TRANSCRIPT_CHARS], user_id
+        )
     except Exception:
         logger.exception("Не удалось обработать расшифровку моделью")
-        result = (
+        if status is not None:
+            await _safe(status.delete())
+        await deliver(
+            update.message,
             "⚠️ Не получилось обработать текст через модель — вот сырая "
-            f"расшифровка:\n\n{recognized}"
+            f"расшифровка:\n\n{recognized}\n\n— — — — —\n{method_note}",
         )
+        return
 
     if status is not None:
         await _safe(status.delete())
 
-    result_with_note = f"{result}\n\n— — — — —\n{method_note}"
-    await deliver(update.message, result_with_note)
-    logger.info("[%s] готово: обработка аудио, %s симв.", user_id, len(result))
+    if intent == "request":
+        # В надиктовке есть поручение ассистенту — прогоняем вычищенный текст
+        # через тот же путь, что и напечатанное сообщение (с циклом вызова
+        # инструментов ClickUp и подтверждением создания задачи).
+        logger.info("[%s] аудио: поручение → общий цикл обработки", user_id)
+        await deliver(
+            update.message,
+            f"🎧 Расшифровал как поручение:\n\n{cleaned}\n\n— — — — —\n{method_note}",
+        )
+        await _handle_user_text(update, context, user_id, cleaned)
+        return
+
+    # Заметка / запись разговора — прежнее поведение: вычищенный текст (+ резюме
+    # для длинной записи), без обращения к инструментам.
+    body = cleaned + (f"\n\n{summary_block}" if summary_block else "")
+    await deliver(update.message, f"{body}\n\n— — — — —\n{method_note}")
+    logger.info(
+        "[%s] готово: обработка аудио (заметка), %s симв.", user_id, len(body)
+    )
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
