@@ -17,10 +17,13 @@
   модели одним запросом. Из нескольких размеров, что шлёт Telegram, берётся
   самый большой;
 - принимает голосовые и аудиофайлы (m4a, mp3, …), в том числе присланные
-  документом: расшифровывает их локально через faster-whisper (модель small,
-  русский), затем прогоняет текст через claude-sonnet-5 — чистит орфографию,
-  пунктуацию, слова-паразиты, разбивает на абзацы; для длинных записей добавляет
-  структурное резюме. Сырая расшифровка не выводится, доступна по /raw;
+  документом: расшифровывает их через OpenAI Whisper API (модель whisper-1,
+  русский); если ключ OPENAI_API_KEY не задан, файл больше лимита API или API
+  вернул ошибку — автоматически переключается на локальную faster-whisper
+  (модель small). В чат добавляется пометка, каким способом сделана расшифровка.
+  Затем текст прогоняется через claude-sonnet-5 — чистит орфографию, пунктуацию,
+  слова-паразиты, разбивает на абзацы; для длинных записей добавляет структурное
+  резюме. Сырая расшифровка не выводится, доступна по /raw;
 - команда /tr включает режим перевода: следующие текстовые сообщения и
   документы переводятся claude-sonnet-5, а не обсуждаются; направление
   перевода определяется автоматически по языку исходного текста; форматирование,
@@ -52,6 +55,7 @@ from datetime import datetime
 
 from anthropic import AsyncAnthropic
 import anthropic
+from openai import AsyncOpenAI
 import docx
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
@@ -77,6 +81,9 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+# Необязательный: если задан — голосовые расшифровываются через OpenAI Whisper
+# API, если нет — сразу локальной моделью faster-whisper (запасной путь).
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Модель Claude, через которую отвечает бот.
 MODEL = "claude-sonnet-5"
@@ -191,10 +198,26 @@ CHARS_PER_PAGE_ESTIMATE = 2500
 TOC_MIN_PAGES = 5
 
 # --- Голосовые сообщения ----------------------------------------------
-# Расшифровка идёт локально через faster-whisper (модель small, русский язык).
-# Модель (~460 МБ) скачивается один раз при первом голосовом и кэшируется.
+# Основной путь расшифровки — OpenAI Whisper API (модель whisper-1, русский).
+# Запасной — локальная faster-whisper (модель small): включается автоматически,
+# если ключ OPENAI_API_KEY не задан, файл больше лимита API или API вернул
+# ошибку. Локальная модель (~460 МБ) скачивается один раз при первом обращении
+# к запасному пути и кэшируется — при старте не грузится.
 WHISPER_MODEL_SIZE = "small"
 WHISPER_LANGUAGE = "ru"
+
+# Модель OpenAI для расшифровки и её лимит на размер файла (25 МБ). Файл больше
+# лимита сразу уходит на локальный путь, без попытки обращения к API.
+OPENAI_WHISPER_MODEL = "whisper-1"
+OPENAI_WHISPER_MAX_FILE_SIZE = 25 * 1024 * 1024
+
+# Пометки в чат — каким способом сделана расшифровка (чтобы было видно, когда
+# сработал запасной вариант).
+TRANSCRIBE_NOTE_OPENAI = "🎙 Расшифровка: OpenAI Whisper API"
+TRANSCRIBE_NOTE_LOCAL = (
+    "⚠️ Расшифровка: локальная модель faster-whisper "
+    "(OpenAI API недоступен или ключ не задан)"
+)
 
 # Максимальная длительность голосового / аудиофайла. Длиннее — бот вежливо
 # откажет (расшифровка долгих записей занимает много времени и памяти).
@@ -261,6 +284,10 @@ request_logger.addHandler(_request_file_handler)
 # --- Клиент Anthropic ---------------------------------------------------
 
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+# Клиент OpenAI — только для расшифровки голосовых через Whisper API. None, если
+# ключ не задан: тогда расшифровка сразу идёт по запасному (локальному) пути.
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 def log_request(
@@ -478,8 +505,10 @@ def extract_text(extension: str, data: bytes) -> str:
     raise ValueError(f"Формат {extension} не поддерживается")
 
 
-# --- Распознавание речи (faster-whisper) --------------------------------
-# Модель тяжёлая, поэтому грузим её один раз и лениво — при первом голосовом.
+# --- Распознавание речи -------------------------------------------------
+# Основной путь — OpenAI Whisper API. Запасной — локальная faster-whisper:
+# модель тяжёлая, поэтому грузим её один раз и лениво — только когда реально
+# понадобился запасной путь (при старте бота не трогаем).
 _whisper_model = None
 _whisper_lock = threading.Lock()
 
@@ -511,8 +540,9 @@ def _get_whisper_model():
     return _whisper_model
 
 
-def transcribe_voice(audio_bytes: bytes) -> str:
-    """Расшифровывает аудио (bytes) в текст. Блокирующая операция — звать через to_thread."""
+def transcribe_voice_local(audio_bytes: bytes) -> str:
+    """Расшифровывает аудио локальной faster-whisper. Блокирующая операция —
+    звать через to_thread. При первом вызове подгружает модель (лениво)."""
     model = _get_whisper_model()
     segments, _info = model.transcribe(
         io.BytesIO(audio_bytes),
@@ -521,6 +551,74 @@ def transcribe_voice(audio_bytes: bytes) -> str:
         vad_filter=True,  # отсекает тишину и шум по краям
     )
     return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+async def transcribe_voice_openai(audio_bytes: bytes, filename: str) -> str:
+    """Расшифровывает аудио через OpenAI Whisper API (модель whisper-1, русский).
+
+    filename нужен API для определения формата — берётся расширение (.oga, .mp3…).
+    Бросает исключение при любой ошибке API — вызывающий переключится на локальный
+    путь.
+    """
+    response = await openai_client.audio.transcriptions.create(
+        model=OPENAI_WHISPER_MODEL,
+        file=(filename, io.BytesIO(audio_bytes)),
+        language=WHISPER_LANGUAGE,
+    )
+    return (response.text or "").strip()
+
+
+async def transcribe_voice(audio_bytes: bytes, filename: str) -> tuple[str, str]:
+    """Расшифровывает аудио и возвращает (текст, пометка_способа_для_чата).
+
+    Основной путь — OpenAI Whisper API. Запасной (локальная faster-whisper)
+    включается автоматически, если ключ OPENAI_API_KEY не задан, файл больше
+    лимита API или API вернул ошибку.
+    """
+    if openai_client is not None:
+        if len(audio_bytes) > OPENAI_WHISPER_MAX_FILE_SIZE:
+            logger.info(
+                "Аудио %s больше лимита OpenAI (%s) — расшифровка локальной моделью",
+                human_size(len(audio_bytes)),
+                human_size(OPENAI_WHISPER_MAX_FILE_SIZE),
+            )
+        else:
+            try:
+                text = await transcribe_voice_openai(audio_bytes, filename)
+                return text, TRANSCRIBE_NOTE_OPENAI
+            except Exception:
+                logger.exception(
+                    "OpenAI Whisper API не сработал — перехожу на локальную модель"
+                )
+    else:
+        logger.info("OPENAI_API_KEY не задан — расшифровка локальной моделью")
+
+    text = await asyncio.to_thread(transcribe_voice_local, audio_bytes)
+    return text, TRANSCRIBE_NOTE_LOCAL
+
+
+def audio_filename(tg_object) -> str:
+    """Имя файла с расширением для OpenAI Whisper API — из имени файла Telegram,
+    иначе по mime-типу (у голосовых это audio/ogg → .oga)."""
+    name = getattr(tg_object, "file_name", None)
+    if name and "." in name:
+        return name
+    mime = (getattr(tg_object, "mime_type", None) or "").split(";")[0].strip()
+    ext = {
+        "audio/ogg": ".oga",
+        "audio/opus": ".oga",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/x-m4a": ".m4a",
+        "audio/aac": ".aac",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/webm": ".webm",
+        "audio/flac": ".flac",
+        "audio/x-flac": ".flac",
+    }.get(mime, ".mp3")
+    return f"audio{ext}"
 
 
 # --- Обработка расшифровки моделью -------------------------------------
@@ -2143,7 +2241,9 @@ async def _transcribe_and_reply(
 
     logger.info("Аудио скачано: %s байт, начинаю расшифровку", len(audio_bytes))
     try:
-        recognized = await asyncio.to_thread(transcribe_voice, audio_bytes)
+        recognized, method_note = await transcribe_voice(
+            audio_bytes, audio_filename(tg_object)
+        )
     except Exception:
         logger.exception("Ошибка расшифровки аудио")
         await fail(
@@ -2152,7 +2252,7 @@ async def _transcribe_and_reply(
         )
         return
 
-    logger.info("Расшифровка готова: %r", (recognized or "")[:200])
+    logger.info("Расшифровка готова (%s): %r", method_note, (recognized or "")[:200])
     recognized = (recognized or "").strip()
     if not recognized:
         await fail(
@@ -2181,9 +2281,10 @@ async def _transcribe_and_reply(
     if status is not None:
         await _safe(status.delete())
 
-    await deliver(update.message, result)
+    result_with_note = f"{result}\n\n— — — — —\n{method_note}"
+    await deliver(update.message, result_with_note)
     if LOG_DIALOG:
-        logger.info("[%s] аудио, результат: %s", user_id, result)
+        logger.info("[%s] аудио, результат: %s", user_id, result_with_note)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
